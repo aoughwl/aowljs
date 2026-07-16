@@ -227,6 +227,52 @@ proc emitRet(e: var JsEmitter; n: var Cursor) =
     e.emit("return "); emitExpr(e, n); e.emit(";")
   consumeParRi n
 
+proc exprToStr(n: var Cursor): string =
+  ## emit one expression into a fresh buffer (for building loop headers).
+  var tmp = JsEmitter(js: "")
+  emitExpr(tmp, n)
+  result = tmp.js
+
+proc emitFor(e: var JsEmitter; n: var Cursor) =
+  ## (for ITER (unpackflat (let :v …)) BODY). Range case: ITER is (infix ..<|.. A B).
+  inc n
+  var lo = "0"
+  var hi = "0"
+  var cmp = " < "
+  var isRange = false
+  if n.kind == ParLe and n.tagEnum == InfixTagId:
+    inc n
+    let opsym = if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: ""
+    let op = opName(opsym)
+    inc n
+    lo = exprToStr(n)
+    hi = exprToStr(n)
+    consumeParRi n
+    if op == "..<": (cmp = " < "; isRange = true)
+    elif op == "..": (cmp = " <= "; isRange = true)
+  else:
+    skip n                      # collection iterators: TODO (from nifjs-js)
+  # loop variable, from (unpackflat (let :v …))
+  var v = "v__i"
+  if n.kind == ParLe and n.tagEnum == UnpackflatTagId:
+    inc n
+    if n.kind == ParLe and n.tagEnum == LetTagId:
+      inc n
+      v = mangle(pool.syms[n.symId]); inc n
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    while n.kind != ParRi: skip n
+    consumeParRi n
+  else:
+    skip n
+  if isRange:
+    e.emit("for(let " & v & " = " & lo & "; " & v & cmp & hi & "; " & v & "++){\n")
+    emitStmt(e, n)
+    e.emit("\n}")
+  else:
+    skip n                      # unsupported iter: skip the body (TODO)
+  consumeParRi n
+
 proc emitStmt(e: var JsEmitter; n: var Cursor) =
   if n.kind != ParLe:
     inc n
@@ -239,6 +285,7 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == IfTagId: emitIf(e, n)
   elif t == WhileTagId: emitWhile(e, n)
   elif t == RetTagId: emitRet(e, n)
+  elif t == ForTagId: emitFor(e, n)
   elif t == BreakTagId: (e.emit("break;"); skip n)
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
   elif t == ProcTagId or t == FuncTagId: emitProc(e, n)
