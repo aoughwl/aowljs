@@ -32,6 +32,24 @@ proc enumLookup(nm: string): string =
     if enumKeys[i] == nm: return enumVals[i]
   return ""
 
+## var/out-param boxing (ported from the JS impl). A `var`/`out` param is passed
+## by reference, but JS primitives pass by value — so a boxed param is passed as
+## an accessor object `{get v(){…}, set v(x){…}}` closing over the caller's lval,
+## and inside the callee every `(hderef p)`/`(haddr p)` reads/writes `p.v`.
+## `boxProcNames[i]` -> comma-wrapped boxed arg indices (",0,2,"), filled by
+## scanProcBoxed. `curBoxed` = the boxed param names of the routine being emitted.
+var boxProcNames: seq[string] = @[]
+var boxProcIdx: seq[string] = @[]
+var curBoxed: seq[string] = @[]
+proc boxLookup(nm: string): string =
+  for i in 0 ..< boxProcNames.len:
+    if boxProcNames[i] == nm: return boxProcIdx[i]
+  return ""
+proc boxContains(nm: string): bool =
+  for b in curBoxed:
+    if b == nm: return true
+  return false
+
 proc emit(e: var JsEmitter; s: string) = e.js.add s
 
 ## a nimony symbol -> a stable, valid JS identifier.
@@ -66,6 +84,7 @@ proc emitStmt(e: var JsEmitter; n: var Cursor)
 proc emitExpr(e: var JsEmitter; n: var Cursor)
 proc exprToStr(n: var Cursor): string
 proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool)
+proc emitBoxArg(e: var JsEmitter; n: var Cursor)
 
 ## the JS operator for a binary-arithmetic/comparison tag, or "" if not one.
 proc binOp(t: TagEnum): string =
@@ -118,14 +137,38 @@ proc emitStmts(e: var JsEmitter; n: var Cursor) =
   while n.kind != ParRi: emitStmt(e, n)
   consumeParRi n
 
-proc emitBinop(e: var JsEmitter; n: var Cursor; op: string) =
-  ## (op TYPE a b) — skip the result-type child, emit (a op b).
+proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
+  ## (op TYPE a b) -> (a op b). For 32-bit add/sub/mul, wrap on overflow
+  ## (Math.imul / `| 0`) so hashing is exact; default 64-bit stays plain.
   inc n
+  var imul = false
+  var wrap32 = false
+  if (t == AddTagId or t == SubTagId or t == MulTagId) and n.kind == ParLe and
+     (n.tagEnum == ITagId or n.tagEnum == UTagId):
+    var d = n; inc d
+    if d.kind == IntLit and pool.integers[d.intId] == 32:
+      if t == MulTagId: imul = true else: wrap32 = true
   skip n                          # the type node
-  e.emit("(")
-  emitExpr(e, n); e.emit(op); emitExpr(e, n)
-  e.emit(")")
+  if imul:
+    e.emit("Math.imul("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+  elif wrap32:
+    e.emit("(("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(") | 0)")
+  else:
+    e.emit("("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(")")
   consumeParRi n
+
+proc emitBoxArg(e: var JsEmitter; n: var Cursor) =
+  ## Box a var/out argument: (haddr LVAL) -> an accessor closing over the lval, so
+  ## the callee's writes to `.v` land back on the caller's variable.
+  var lv = ""
+  if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+    inc n
+    lv = exprToStr(n)
+    while n.kind != ParRi: skip n
+    consumeParRi n
+  else:
+    lv = exprToStr(n)
+  e.emit("{get v(){return " & lv & ";}, set v(_x){" & lv & " = _x;}}")
 
 proc emitCall(e: var JsEmitter; n: var Cursor) =
   ## (call CALLEE ARGS…) / (cmd …). echo -> write(stdout,X) -> __w(X); the common
@@ -198,13 +241,19 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("("); emitExpr(e, n); e.emit(")." & jn & "("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   else:
+    let boxed = boxLookup(name)                # ",i,j," of boxed param positions
     e.emit(mangle(callee)); inc n
     e.emit("(")
     var first = true
+    var idx = 0
     while n.kind != ParRi:
       if not first: e.emit(", ")
       first = false
-      emitExpr(e, n)
+      if boxed.len > 0 and boxed.contains("," & $idx & ","):
+        emitBoxArg(e, n)                       # pass the caller's lval by reference
+      else:
+        emitExpr(e, n)
+      inc idx
     e.emit(")")
   consumeParRi n
 
@@ -268,7 +317,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
   of ParLe:
     let t = n.tagEnum
     let bop = binOp(t)
-    if bop.len > 0: emitBinop(e, n, bop)
+    if bop.len > 0: emitBinop(e, n, bop, t)
     elif t == DivTagId:
       inc n
       let isFloat = n.kind == ParLe and n.tagEnum == FTagId
@@ -287,7 +336,12 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
     elif t == BitnotTagId:
       inc n; e.emit("(~"); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == HderefTagId or t == HaddrTagId:
-      inc n; emitExpr(e, n)
+      inc n
+      if (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident) and
+         boxContains(mangle(pool.syms[n.symId])):
+        e.emit(mangle(pool.syms[n.symId]) & ".v"); inc n   # boxed var-param cell
+      else:
+        emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == ConvTagId or t == HconvTagId:
@@ -431,8 +485,12 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
   while n.kind != ParRi:
     if n.kind == ParLe and n.tagEnum == ParamTagId:
       inc n
-      result.add mangle(pool.syms[n.symId])   # the param's symbol def
+      let pnm = mangle(pool.syms[n.symId])     # the param's symbol def
+      result.add pnm
       inc n
+      skip n; skip n                           # export, pragmas
+      if n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId):
+        curBoxed.add pnm                        # var/out param -> boxed
       while n.kind != ParRi: skip n
       consumeParRi n
     else:
@@ -444,15 +502,18 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
   inc n
   let name = mangle(pool.syms[n.symId]); inc n
   var params: seq[string] = @[]
+  let savedBoxed = curBoxed
+  curBoxed = @[]
   while n.kind != ParRi:
     if n.kind == ParLe and n.tagEnum == ParamsTagId:
-      params = collectParams(e, n)
+      params = collectParams(e, n)             # also fills curBoxed
     elif n.kind == ParLe and n.tagEnum == StmtsTagId:
       e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
       emitStmts(e, n)
       e.emit("\n}\n")
     else:
       skip n
+  curBoxed = savedBoxed
   consumeParRi n
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
@@ -644,9 +705,49 @@ proc scanEnums(n: var Cursor) =
     while n.kind != ParRi: scanEnums(n)
     consumeParRi n
 
+proc scanProcBoxed(n: var Cursor) =
+  ## walk the tree; for each (proc/func :name … (params …)) record which param
+  ## positions are var/out, so call sites know which args to box.
+  if n.kind != ParLe:
+    inc n
+    return
+  if n.tagEnum == ProcTagId or n.tagEnum == FuncTagId:
+    inc n
+    let pname = opName(pool.syms[n.symId]); inc n
+    var idxs: seq[int] = @[]
+    while n.kind != ParRi:
+      if n.kind == ParLe and n.tagEnum == ParamsTagId:
+        inc n
+        var i = 0
+        while n.kind != ParRi:
+          if n.kind == ParLe and n.tagEnum == ParamTagId:
+            inc n
+            skip n            # param symbol
+            skip n; skip n    # export, pragmas
+            if n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId):
+              idxs.add i
+            while n.kind != ParRi: skip n
+            consumeParRi n
+            inc i
+          else: skip n
+        consumeParRi n
+      else: skip n
+    if idxs.len > 0:
+      var s = ","
+      for bi in idxs: s.add $bi & ","
+      boxProcNames.add pname
+      boxProcIdx.add s
+    consumeParRi n
+  else:
+    inc n
+    while n.kind != ParRi: scanProcBoxed(n)
+    consumeParRi n
+
 proc emitModule*(root: var Cursor): string =
   var scanCur = root
   scanEnums(scanCur)            # collect enum ordinals from a separate cursor
+  var scanCur2 = root
+  scanProcBoxed(scanCur2)       # collect var/out param positions per routine
   var e = JsEmitter(js: "")
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
