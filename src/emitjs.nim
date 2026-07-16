@@ -76,10 +76,34 @@ proc binOp(t: TagEnum): string =
   elif t == LeTagId: " <= "
   elif t == EqTagId: " === "
   elif t == NeqTagId: " !== "
+  elif t == BitandTagId: " & "
+  elif t == BitorTagId: " | "
+  elif t == BitxorTagId: " ^ "
+  elif t == ShlTagId: " << "
+  elif t == ShrTagId: " >> "
+  elif t == AshrTagId: " >> "
   else: ""
 
 proc isCallTag(t: TagEnum): bool =
   t == CallTagId or t == CmdTagId or t == InfixTagId or t == PrefixTagId or t == HcallTagId
+
+## best-effort "is this echoed value a float?" (peeks a Cursor copy) — a float
+## literal, an arithmetic op with a `(f …)` result type, or a float-returning
+## math call. Used only to keep integer-valued floats printing as `7.0`, not `7`.
+proc looksFloat(c: Cursor): bool =
+  if c.kind == FloatLit: return true
+  if c.kind != ParLe: return false
+  let t = c.tagEnum
+  if t == AddTagId or t == SubTagId or t == MulTagId or t == DivTagId:
+    var d = c; inc d
+    return d.kind == ParLe and d.tagEnum == FTagId
+  if t == CallTagId or t == HcallTagId:
+    var d = c; inc d
+    let callee = if d.kind == Symbol or d.kind == SymbolDef: pool.syms[d.symId] else: ""
+    let nm = opName(callee)
+    return nm == "sqrt" or nm == "pow" or nm == "sin" or nm == "cos" or nm == "tan" or
+           nm == "exp" or nm == "ln" or nm == "hypot" or nm == "floor" or nm == "ceil"
+  return false
 
 proc joinList(xs: seq[string]; sep: string): string =
   result = ""
@@ -111,7 +135,8 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   let name = opName(callee)
   if name == "write":
     skip n; skip n                # callee, stdout
-    e.emit("__w("); emitExpr(e, n); e.emit(")")
+    e.emit(if looksFloat(n): "__wf(" else: "__w(")
+    emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "len":
     skip n; e.emit("("); emitExpr(e, n); e.emit(".length)")
@@ -132,6 +157,45 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     while n.kind != ParRi: skip n
   elif name == "&":
     skip n; e.emit("("); emitExpr(e, n); e.emit(" + "); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "chr":
+    skip n; e.emit("String.fromCharCode("); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "ord":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)")
+    while n.kind != ParRi: skip n
+  elif name == "abs":
+    skip n; e.emit("Math.abs("); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "min" or name == "max" or name == "sqrt" or name == "floor" or
+       name == "ceil" or name == "round" or name == "trunc" or name == "sin" or
+       name == "cos" or name == "tan" or name == "exp" or name == "ln" or name == "pow":
+    let jn = if name == "ln": "log" else: name    # math.* -> Math.*
+    skip n; e.emit("Math." & jn & "(")
+    var mfirst = true
+    while n.kind != ParRi:
+      if not mfirst: e.emit(", ")
+      mfirst = false
+      emitExpr(e, n)
+    e.emit(")")
+  elif name == "toLowerAscii" or name == "toLower":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").toLowerCase()")
+    while n.kind != ParRi: skip n
+  elif name == "toUpperAscii" or name == "toUpper":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").toUpperCase()")
+    while n.kind != ParRi: skip n
+  elif name == "strip":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").trim()")
+    while n.kind != ParRi: skip n
+  elif name == "repeat":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").repeat("); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "split":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").split("); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "contains" or name == "startsWith" or name == "endsWith":
+    let jn = if name == "contains": "includes" else: name
+    skip n; e.emit("("); emitExpr(e, n); e.emit(")." & jn & "("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   else:
     e.emit(mangle(callee)); inc n
@@ -206,7 +270,12 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
     let bop = binOp(t)
     if bop.len > 0: emitBinop(e, n, bop)
     elif t == DivTagId:
-      inc n; skip n; e.emit("(Math.trunc("); emitExpr(e, n); e.emit(" / "); emitExpr(e, n); e.emit("))"); consumeParRi n
+      inc n
+      let isFloat = n.kind == ParLe and n.tagEnum == FTagId
+      skip n
+      if isFloat: (e.emit("("); emitExpr(e, n); e.emit(" / "); emitExpr(e, n); e.emit(")"))
+      else: (e.emit("(Math.trunc("); emitExpr(e, n); e.emit(" / "); emitExpr(e, n); e.emit("))"))
+      consumeParRi n
     elif t == ModTagId:
       inc n; skip n; e.emit("("); emitExpr(e, n); e.emit(" % "); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == AndTagId:
@@ -215,12 +284,65 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
       inc n; e.emit("("); emitExpr(e, n); e.emit(" || "); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == NotTagId:
       inc n; e.emit("(!"); emitExpr(e, n); e.emit(")"); consumeParRi n
+    elif t == BitnotTagId:
+      inc n; e.emit("(~"); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == HderefTagId or t == HaddrTagId:
       inc n; emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == ConvTagId or t == HconvTagId:
-      inc n; skip n; emitExpr(e, n)            # (conv TYPE VALUE) -> VALUE
+      inc n                                     # (conv TYPE VALUE) -> VALUE
+      let toInt = n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId)
+      skip n
+      if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
+      else: emitExpr(e, n)
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == IfTagId:                          # if-EXPRESSION -> IIFE
+      inc n
+      e.emit("(function(){ ")
+      var ifirst = true
+      while n.kind != ParRi:
+        if n.kind == ParLe and n.tagEnum == ElifTagId:
+          inc n
+          e.emit(if ifirst: "if(" else: " else if(")
+          ifirst = false
+          emitExpr(e, n); e.emit("){ return "); emitExpr(e, n); e.emit("; }")
+          consumeParRi n
+        elif n.kind == ParLe and n.tagEnum == ElseTagId:
+          inc n; e.emit(" else { return "); emitExpr(e, n); e.emit("; }"); consumeParRi n
+        else: skip n
+      e.emit(" })()"); consumeParRi n
+    elif t == SetconstrTagId:                   # set literal -> JS Set
+      inc n; skip n                             # (set TYPE)
+      e.emit("(function(){ const _s = new Set(); ")
+      while n.kind != ParRi:
+        if n.kind == ParLe and n.tagEnum == RangeTagId:
+          inc n
+          e.emit("for(let _i=" & exprToStr(n) & "; _i<=" & exprToStr(n) & "; _i++) _s.add(_i); ")
+          consumeParRi n
+        else:
+          e.emit("_s.add(" & exprToStr(n) & "); ")
+      e.emit("return _s; })()"); consumeParRi n
+    elif t == InsetTagId:                        # membership: (inset TYPE SET VALUE)
+      inc n; skip n                             # set type
+      # SET (inline setconstr -> OR-chain) then VALUE
+      if n.kind == ParLe and n.tagEnum == SetconstrTagId:
+        inc n; skip n
+        var conds: seq[string] = @[]
+        while n.kind != ParRi:
+          if n.kind == ParLe and n.tagEnum == RangeTagId:
+            inc n
+            conds.add("(_v >= " & exprToStr(n) & " && _v <= " & exprToStr(n) & ")")
+            consumeParRi n
+          else:
+            conds.add("(_v === " & exprToStr(n) & ")")
+        consumeParRi n
+        let body = if conds.len > 0: joinList(conds, " || ") else: "false"
+        e.emit("(function(_v){ return " & body & "; })(" & exprToStr(n) & ")")
+      else:
+        let setExpr = exprToStr(n)
+        e.emit("(" & setExpr & ".has(" & exprToStr(n) & "))")
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == SufTagId:
@@ -292,6 +414,9 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
       consumeParRi n
     elif t == CaseTagId:
       emitCase(e, n, true)
+    elif t == TrueTagId: (e.emit("true"); skip n)
+    elif t == FalseTagId: (e.emit("false"); skip n)
+    elif t == NilTagId: (e.emit("null"); skip n)
     elif isCallTag(t):
       emitCall(e, n)
     else:
@@ -412,45 +537,66 @@ proc collExpr(n: var Cursor): string =
   result = exprToStr(n)
 
 proc emitFor(e: var JsEmitter; n: var Cursor) =
-  ## (for ITER (unpackflat (let :v …)) BODY) — range or collection.
+  ## (for ITER (unpackflat (let :v …)…) BODY) — range | countdown | collection,
+  ## with 1 loop var (`for x in`) or 2 (`for i, x in`).
   inc n
-  var lo = "0"
-  var hi = "0"
+  var kind = 0                  # 0=collection, 1=range, 2=countdown
+  var a = "0"                   # range lo / countdown from
+  var b = "0"                   # range hi / countdown to
   var cmp = " < "
-  var isRange = false
+  var step = "1"
   var coll = ""
   if n.kind == ParLe and n.tagEnum == InfixTagId:
     inc n
-    let opsym = if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: ""
-    let op = opName(opsym)
+    let op = opName(if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: "")
     inc n
-    lo = exprToStr(n)
-    hi = exprToStr(n)
-    consumeParRi n
-    if op == "..<": (cmp = " < "; isRange = true)
-    elif op == "..": (cmp = " <= "; isRange = true)
+    a = exprToStr(n); b = exprToStr(n); consumeParRi n
+    if op == "..<": (cmp = " < "; kind = 1)
+    elif op == "..": (cmp = " <= "; kind = 1)
     else: coll = "[]"
   else:
-    coll = collExpr(n)          # collection loop -> for..of
-  # loop variable(s), from (unpackflat (let :v …) …)
-  var v = "v__i"
-  if n.kind == ParLe and n.tagEnum == UnpackflatTagId:
-    inc n
-    if n.kind == ParLe and n.tagEnum == LetTagId:
-      inc n
-      v = mangle(pool.syms[n.symId]); inc n
+    var isCd = false
+    if n.kind == ParLe and (n.tagEnum == CallTagId or n.tagEnum == HcallTagId):
+      var probe = n; inc probe
+      let cn = opName(if probe.kind == Symbol or probe.kind == SymbolDef: pool.syms[probe.symId] else: "")
+      if cn == "countdown": isCd = true
+    if isCd:
+      inc n; skip n             # past call, callee
+      a = exprToStr(n); b = exprToStr(n)
+      if n.kind != ParRi: step = exprToStr(n)
       while n.kind != ParRi: skip n
       consumeParRi n
-    while n.kind != ParRi: skip n
+      kind = 2
+    else:
+      coll = collExpr(n)
+  # loop variables (1 or 2), from (unpackflat (let :v …)…)
+  var vars: seq[string] = @[]
+  if n.kind == ParLe and n.tagEnum == UnpackflatTagId:
+    inc n
+    while n.kind != ParRi:
+      if n.kind == ParLe and (n.tagEnum == LetTagId or n.tagEnum == VarTagId):
+        inc n
+        vars.add mangle(pool.syms[n.symId]); inc n
+        while n.kind != ParRi: skip n
+        consumeParRi n
+      else: skip n
     consumeParRi n
   else:
     skip n
-  if isRange:
-    e.emit("for(let " & v & " = " & lo & "; " & v & cmp & hi & "; " & v & "++){\n")
+  let v0 = if vars.len > 0: vars[0] else: "v__i"
+  if kind == 1:
+    e.emit("for(let " & v0 & " = " & a & "; " & v0 & cmp & b & "; " & v0 & "++){\n")
+    emitStmt(e, n); e.emit("\n}")
+  elif kind == 2:
+    e.emit("for(let " & v0 & " = " & a & "; " & v0 & " >= " & b & "; " & v0 & " -= " & step & "){\n")
+    emitStmt(e, n); e.emit("\n}")
+  elif vars.len >= 2:           # for i, x in coll -> indexed
+    e.emit("{ const _c = " & coll & "; for(let " & vars[0] & " = 0; " & vars[0] &
+           " < _c.length; " & vars[0] & "++){ const " & vars[1] & " = _c[" & vars[0] & "];\n")
+    emitStmt(e, n); e.emit("\n} }")
   else:
-    e.emit("for(const " & v & " of " & coll & "){\n")
-  emitStmt(e, n)
-  e.emit("\n}")
+    e.emit("for(const " & v0 & " of " & coll & "){\n")
+    emitStmt(e, n); e.emit("\n}")
   consumeParRi n
 
 proc emitStmt(e: var JsEmitter; n: var Cursor) =
@@ -504,6 +650,7 @@ proc emitModule*(root: var Cursor): string =
   var e = JsEmitter(js: "")
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
+  e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
   # root is the module `(stmts …)`: procs float up (JS hoists function decls),
   # top-level runs at module scope, then we return the captured output.
   emitStmt(e, root)
