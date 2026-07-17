@@ -58,6 +58,30 @@ proc boxContains(nm: string): bool =
     if b == nm: return true
   return false
 
+## Exception support. A ref-object type that transitively inherits `Exception`
+## is emitted as a real JS `class … extends …` (so `new T(…)` and `x instanceof T`
+## work); regular ref-objects stay plain object literals. `excClassNames` holds the
+## mangled *Obj*-type names (the ones referenced by `newobj`/`instanceof`);
+## `excClassBase` the parallel JS parent (another exc class, or `Error`). Filled by
+## scanExcTypes before emission.
+var excClassNames: seq[string] = @[]
+var excClassBase: seq[string] = @[]
+proc isExcClass(nm: string): bool =
+  for c in excClassNames:
+    if c == nm: return true
+  return false
+proc excParent(nm: string): string =
+  for i in 0 ..< excClassNames.len:
+    if excClassNames[i] == nm: return excClassBase[i]
+  return "Error"
+
+## `pendingThrow` stashes the JS expression built when nimony assigns a freshly
+## constructed exception to its `exc` threadvar; the following `(raise …)` consumes
+## it as `throw <expr>`. `curCatchVar` names the active `catch` binding, so a
+## `(raise .)` re-raise becomes `throw <catchVar>`.
+var pendingThrow = ""
+var curCatchVar = ""
+
 proc emit(e: var JsEmitter; s: string) = e.js.add s
 
 ## faithful-export mode (opt-in via the CLI `--faithful` flag). In faithful mode
@@ -163,6 +187,23 @@ proc isInstanceSym(name: string): bool =
 ## branch so a user `proc add`/`len`/… is emitted as a plain call, not hijacked.
 proc isMagicSym(name: string): bool =
   result = name.contains("sysvq0asl") or isInstanceSym(name)
+
+## the mangled Obj-class name behind a `(ref X (notnil))` | `X` type node (the
+## form `newobj`/`instanceof` reference); "" if it is not a plain symbol/ref.
+proc excRefClassName(c: Cursor): string =
+  var n = c
+  if n.kind == ParLe and n.tagEnum == RefTagId: inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    result = mangle(pool.syms[n.symId])
+  else:
+    result = ""
+
+## true iff the cursor is nimony's `exc` exception threadvar (a system global).
+proc isExcThreadvar(c: Cursor): bool =
+  if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+    let nm = pool.syms[c.symId]
+    return opName(nm) == "exc" and nm.contains("sysvq0asl")
+  return false
 
 ## classify a type node (unwrapping mut/out/sink/lent/rangetype) as char / string.
 ## 1 = char, 2 = string/cstring, 0 = neither.
@@ -745,6 +786,22 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         else: emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
+    elif t == CastTagId:
+      # (cast TYPE VALUE) — a ref/pointer cast is identity in JS; emit VALUE.
+      inc n; skip n
+      emitExpr(e, n, wantBig)
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == InstanceofTagId:
+      # (instanceof VALUE TYPE) -> `VALUE instanceof Class` (exception dispatch).
+      inc n
+      emitExpr(e, n)
+      e.emit(" instanceof ")
+      let cls = excRefClassName(n)
+      e.emit(if cls.len > 0: cls else: "Object")
+      skip n
+      while n.kind != ParRi: skip n
+      consumeParRi n
     elif t == IfTagId:                          # if-EXPRESSION -> IIFE
       inc n
       e.emit("(function(){ ")
@@ -892,7 +949,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       # reference, so it lowers to the identical literal. Inherited base fields are
       # already flattened into the kv list by sem. Omitted ref fields default to a
       # nil-conv (-> null), so every field carries its zero value.
-      inc n; skip n                             # TYPE
+      inc n
+      # An exception type is a real JS class: `new Cls({fields})`. A plain
+      # ref/value object stays an object literal `({fields})`.
+      let cls = excRefClassName(n)
+      let isExc = cls.len > 0 and isExcClass(cls)
+      skip n                                     # TYPE
+      if isExc: e.emit("new " & cls & "(")
       e.emit("({")
       var first = true
       while n.kind != ParRi:
@@ -905,7 +968,9 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
           while n.kind != ParRi: skip n         # trailing inheritance-depth marker
           consumeParRi n
         else: skip n
-      e.emit("})"); consumeParRi n
+      e.emit("})")
+      if isExc: e.emit(")")
+      consumeParRi n
     elif t == DotTagId or t == DdotTagId:
       # (dot OBJ FIELD idx "name"); ddot is the ref-object deref-dot — the deref is
       # implicit in JS (objects are references), so both are just `OBJ.field`.
@@ -1097,6 +1162,20 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
 
 proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   inc n
+  if isExcThreadvar(n):
+    # nimony threads a raise through the `exc` global: `exc = <newobj>` right
+    # before `(raise …)`. Stash the constructed exception so the raise throws it;
+    # `exc = nil` / `exc = err` bookkeeping is dropped (JS uses the catch binding).
+    skip n                                       # LHS (the exc threadvar)
+    if n.kind == ParLe and (n.tagEnum == CastTagId or n.tagEnum == NewobjTagId or
+                            n.tagEnum == OconstrTagId):
+      var tmp = JsEmitter(js: "")
+      var rhs = n
+      emitExpr(tmp, rhs)
+      pendingThrow = tmp.js
+    skip n                                        # RHS
+    consumeParRi n
+    return
   # if the lvalue is a known bigint local, a bare-literal RHS must be bigint too.
   var lhsBig = false
   if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
@@ -1256,14 +1335,40 @@ proc emitTry(e: var JsEmitter; n: var Cursor) =
   e.emit("\n}")
   while n.kind != ParRi:
     if n.kind == ParLe and n.tagEnum == ExceptTagId:
-      # (except <type/binding headers…> BODY) — JS has one dynamic catch binding, so
-      # collapse every except branch's body into a single catch (best effort: the
-      # exception type match and the bound variable are dropped).
-      inc n
-      e.emit(" catch(_ex) {\n")
-      while n.kind != ParRi:
-        if n.kind == ParLe and n.tagEnum == StmtsTagId: emitStmt(e, n)
-        else: skip n
+      # (except . BODY) — nimony has already lowered `except T as e / except:` into
+      # an `if (instanceof err T) …` cascade inside BODY, threaded through the `exc`
+      # global and an `err` alias. JS has one dynamic catch binding, so: name the
+      # catch after that `err` alias (the `(let :err … exc)` is then redundant and
+      # dropped), and let the cascade's `instanceof`/`cursor`/re-raise fall out of
+      # the generic emit (see emitExpr/InstanceofTagId, CursorTagId, RaiseTagId).
+      inc n                                       # past 'except'
+      if n.kind == DotToken: inc n                # catch-all filter `.`
+      elif n.kind != ParRi: skip n                # explicit type filter (unused in JS)
+      var catchVar = "_ex"
+      block:                                      # probe BODY for `(let :err … exc)`
+        var probe = n
+        if probe.kind == ParLe and probe.tagEnum == StmtsTagId:
+          inc probe
+          while probe.kind != ParRi:
+            if probe.kind == ParLe and probe.tagEnum == LetTagId:
+              inc probe
+              catchVar = mangle(pool.syms[probe.symId])
+              break
+            else: skip probe
+      e.emit(" catch(" & catchVar & ") {\n")
+      let savedCatch = curCatchVar
+      curCatchVar = catchVar
+      if n.kind == ParLe and n.tagEnum == StmtsTagId:
+        inc n
+        while n.kind != ParRi:
+          if n.kind == ParLe and n.tagEnum == LetTagId: skip n   # drop `let err = exc`
+          else: emitStmt(e, n)
+        consumeParRi n
+      else:
+        while n.kind != ParRi:
+          if n.kind == ParLe and n.tagEnum == StmtsTagId: emitStmt(e, n)
+          else: skip n
+      curCatchVar = savedCatch
       e.emit("\n}")
       consumeParRi n
     elif n.kind == ParLe and n.tagEnum == FinTagId:
@@ -1277,6 +1382,19 @@ proc emitTry(e: var JsEmitter; n: var Cursor) =
       skip n
   consumeParRi n
 
+proc emitType(e: var JsEmitter; n: var Cursor) =
+  ## Most type decls vanish (JS is untyped). An exception type, though, must be a
+  ## real class so `new T(…)` / `x instanceof T` work — emit it as one. Base fields
+  ## are flattened into every `newobj`, so the constructor just copies the field bag.
+  var c = n
+  inc c
+  if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+    let nm = mangle(pool.syms[c.symId])
+    if isExcClass(nm):
+      e.emit("class " & nm & " extends " & excParent(nm) &
+             " { constructor(f){ super(); if(f) Object.assign(this, f); } }\n")
+  skip n
+
 proc emitStmt(e: var JsEmitter; n: var Cursor) =
   if n.kind != ParLe:
     inc n
@@ -1284,8 +1402,24 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   let t = n.tagEnum
   if t == StmtsTagId: emitStmts(e, n)
   elif t == TryTagId: emitTry(e, n)
+  elif t == TypeTagId: emitType(e, n)
   elif t == VarTagId or t == LetTagId or t == ConstTagId or t == GvarTagId or
-       t == GletTagId or t == ResultTagId: emitLocal(e, n)
+       t == GletTagId or t == ResultTagId or t == CursorTagId: emitLocal(e, n)
+  elif t == RaiseTagId:
+    inc n
+    if n.kind == DotToken:                        # `(raise .)` -> re-raise
+      e.emit("throw " & (if curCatchVar.len > 0: curCatchVar else: "new Error()") & ";")
+      inc n
+    elif pendingThrow.len > 0:                    # a stashed `exc = newobj`
+      e.emit("throw " & pendingThrow & ";"); pendingThrow = ""
+      skip n
+    else:                                         # bare `raise ErrorCode`
+      var nm = ""
+      if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+        nm = opName(pool.syms[n.symId])
+      e.emit("throw new Error(" & jsString(nm) & ");")
+      skip n
+    consumeParRi n
   elif t == AsgnTagId: emitAsgn(e, n)
   elif t == IfTagId: emitIf(e, n)
   elif t == WhileTagId: emitWhile(e, n)
@@ -1302,6 +1436,36 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
     e.emit("yield "); emitExpr(e, n, curRetBig); e.emit(";")
     consumeParRi n
   else: skip n
+
+proc scanExcTypes(n: var Cursor) =
+  ## walk the tree; record every object type transitively inheriting `Exception`
+  ## (base is `Exception…`, or another already-recorded exception object type) so
+  ## it is later emitted as a real JS class. Base types precede derived ones in the
+  ## decl order nimony emits, so a single forward pass resolves the chain.
+  if n.kind != ParLe:
+    inc n
+    return
+  if n.tagEnum == TypeTagId:
+    var c = n
+    inc c                                # NAME
+    let nm = if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+               mangle(pool.syms[c.symId]) else: ""
+    inc c                                # past NAME -> export/typevars/pragmas…
+    while c.kind != ParRi and not (c.kind == ParLe and c.tagEnum == ObjectTagId):
+      skip c                             # skip export, typevars, pragmas to the body
+    if nm.len > 0 and c.kind == ParLe and c.tagEnum == ObjectTagId:
+      inc c                              # -> BASE (sym) | `.`
+      if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+        let baseNm = pool.syms[c.symId]
+        if opName(baseNm) == "Exception":
+          excClassNames.add nm; excClassBase.add "Error"
+        elif isExcClass(mangle(baseNm)):
+          excClassNames.add nm; excClassBase.add mangle(baseNm)
+    skip n
+  else:
+    inc n
+    while n.kind != ParRi: scanExcTypes(n)
+    consumeParRi n
 
 proc scanEnums(n: var Cursor) =
   ## walk the tree; for (enum … (efld :val … (tup ORD "name"))) record val->ORD.
@@ -1406,6 +1570,8 @@ proc emitModuleBody*(root: var Cursor): string =
   scanEnums(scanCur)
   var scanCur2 = root
   scanProcBoxed(scanCur2)
+  var scanCur3 = root
+  scanExcTypes(scanCur3)
   var e = JsEmitter(js: "")
   emitStmt(e, root)
   result = e.js
