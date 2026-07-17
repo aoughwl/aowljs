@@ -223,6 +223,9 @@ proc looksFloat(c: Cursor): bool =
     let nm = opName(callee)
     return nm == "sqrt" or nm == "pow" or nm == "sin" or nm == "cos" or nm == "tan" or
            nm == "exp" or nm == "ln" or nm == "hypot" or nm == "floor" or nm == "ceil"
+  if t == ConvTagId or t == HconvTagId:      # float(x) / conv-to-float -> show N.0
+    var d = c; inc d
+    return d.kind == ParLe and d.tagEnum == FTagId
   return false
 
 proc joinList(xs: seq[string]; sep: string): string =
@@ -534,12 +537,15 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       inc n; e.emit("(!"); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == BitnotTagId:
       inc n
-      if faithfulMode and n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
-        let k = int64Kind(n); skip n
-        if k > 0:
-          let w = if k == 1: "_i64" else: "_u64"
-          e.emit(w & "(~"); emitExpr(e, n, true); e.emit(")")
-        else: (e.emit("(~"); emitExpr(e, n); e.emit(")"))
+      # bitnot always carries a leading type child (i N)/(u N); skip it in both
+      # modes (fast mode used to emit it as an expression and desync the cursor).
+      var k = 0
+      if n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
+        if faithfulMode: k = int64Kind(n)
+        skip n
+      if k > 0:
+        let w = if k == 1: "_i64" else: "_u64"
+        e.emit(w & "(~"); emitExpr(e, n, true); e.emit(")")
       else:
         e.emit("(~"); emitExpr(e, n); e.emit(")")
       consumeParRi n
@@ -565,6 +571,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       inc n                                     # (conv TYPE VALUE) -> VALUE
       let targetK = if faithfulMode: int64Kind(n) else: 0
       let toInt = n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId)
+      let toChar = n.kind == ParLe and n.tagEnum == CTagId
       skip n                                    # target type; n now at source expr
       if targetK > 0:
         # narrower/number/float source -> bigint: BigInt() then width-wrap.
@@ -579,6 +586,8 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       else:
         if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
         elif toInt and sourceIsChar(n): (e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)"))
+        elif toInt: (e.emit("Math.trunc("); emitExpr(e, n); e.emit(")"))
+        elif toChar and not sourceIsChar(n): (e.emit("String.fromCharCode("); emitExpr(e, n); e.emit(")"))
         else: emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
