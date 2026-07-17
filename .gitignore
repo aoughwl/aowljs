@@ -3,3 +3,4 @@ nimcache/
 !runtime/aowl-rt.js
 bin/
 tests/_out_faithful/
+tests/_out_corpus/
