@@ -96,6 +96,26 @@ proc charAdd(nm: string) =
 proc strAdd(nm: string) =
   if not listHas(strVars, nm): strVars.add nm
 
+## names (mangled) of locals/params whose static type is a float. A JS `number`
+## carries no int-vs-float tag at runtime, so `echo`/`$` of a bare float variable
+## would print `1` instead of `1.0` and `int(floatVar)` in faithful mode would hit
+## `BigInt(3.9)` (RangeError). `looksFloat` consults this so those route correctly.
+var floatVars: seq[string] = @[]
+proc floatAdd(nm: string) =
+  if not listHas(floatVars, nm): floatVars.add nm
+## tuple locals -> the float element indices (base62-free, small): `t[2]` on a
+## `(1, "two", 3.0)` must show `3.0`. Parallel seqs keyed by tuple var name.
+var tupleVars: seq[string] = @[]
+var tupleFloatIdx: seq[seq[int]] = @[]
+proc tupleFloatsFor(nm: string): seq[int] =
+  for i in 0 ..< tupleVars.len:
+    if tupleVars[i] == nm: return tupleFloatIdx[i]
+  return @[]
+proc hasInt(xs: seq[int]; v: int): bool =
+  for x in xs:
+    if x == v: return true
+  return false
+
 ## true iff the proc currently being emitted returns a 64-bit int (faithful mode);
 ## a bare-literal `return` in such a proc must emit bigint.
 var curRetBig: bool = false
@@ -233,10 +253,50 @@ proc isCallTag(t: TagEnum): bool =
 ## best-effort "is this echoed value a float?" (peeks a Cursor copy) — a float
 ## literal, an arithmetic op with a `(f …)` result type, or a float-returning
 ## math call. Used only to keep integer-valued floats printing as `7.0`, not `7`.
+proc isFloatType(c: Cursor): bool =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
+    inc n
+  if n.kind == ParLe and n.tagEnum == FTagId: return true
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    let nm = opName(pool.syms[n.symId])
+    return nm == "float" or nm == "float32" or nm == "float64" or
+           nm == "cfloat" or nm == "cdouble"
+  return false
+
+## the float element indices of a `(tuple T0 T1 …)` type node ((kv f T) for named).
+proc tupleFloatIndices(c: Cursor): seq[int] =
+  result = @[]
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId):
+    inc n
+  if not (n.kind == ParLe and n.tagEnum == TupleTagId): return
+  inc n
+  var idx = 0
+  while n.kind != ParRi:
+    var el = n
+    if el.kind == ParLe and el.tagEnum == KvTagId:
+      inc el; skip el                          # (kv field TYPE) -> TYPE
+    if isFloatType(el): result.add idx
+    skip n
+    inc idx
+
 proc looksFloat(c: Cursor): bool =
   if c.kind == FloatLit: return true
+  if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+    return listHas(floatVars, mangle(pool.syms[c.symId]))
   if c.kind != ParLe: return false
   let t = c.tagEnum
+  if t == TupatTagId:                          # (tupat tupleVar idx) into a float slot
+    var d = c; inc d
+    if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
+      let fs = tupleFloatsFor(mangle(pool.syms[d.symId]))
+      if fs.len > 0:
+        skip d                                 # past the tuple operand
+        if d.kind == IntLit: return hasInt(fs, int(pool.integers[d.intId]))
+    return false
   if t == AddTagId or t == SubTagId or t == MulTagId or t == DivTagId:
     var d = c; inc d
     return d.kind == ParLe and d.tagEnum == FTagId
@@ -435,7 +495,9 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("\"\"")                    # newString(n) -> empty string
     while n.kind != ParRi: skip n
   elif name == "$" and magic:
-    skip n; e.emit("String("); emitExpr(e, n); e.emit(")")
+    skip n
+    if looksFloat(n): (e.emit("__sf("); emitExpr(e, n); e.emit(")"))
+    else: (e.emit("String("); emitExpr(e, n); e.emit(")"))
     while n.kind != ParRi: skip n
   elif (name == "==" or name == "!=" or name == "<" or name == "<=" or
         name == ">" or name == ">=") and magic:
@@ -746,7 +808,9 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       let opsym = if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: ""
       let op = opName(opsym)
       inc n
-      if op == "$": (e.emit("String("); emitExpr(e, n); e.emit(")"))
+      if op == "$":
+        if looksFloat(n): (e.emit("__sf("); emitExpr(e, n); e.emit(")"))
+        else: (e.emit("String("); emitExpr(e, n); e.emit(")"))
       else: emitExpr(e, n)                      # `@` on an array literal -> the array
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -830,6 +894,7 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       of 1: charAdd pnm
       of 2: strAdd pnm
       else: discard
+      if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
       skip n                       # type
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -890,6 +955,17 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
       var ic = sh.init
       if ic.kind == CharLit: isCh = true
     if isCh: charAdd nm else: strAdd nm
+  block:                                        # track float vars (echo/$ must show .0)
+    var isF = isFloatType(sh.typ)
+    if not isF and sh.hasInit:
+      var ic = sh.init
+      if ic.kind == FloatLit: isF = true
+    if isF: floatAdd nm
+  block:                                        # track a tuple var's float element slots
+    let fis = tupleFloatIndices(sh.typ)
+    if fis.len > 0:
+      tupleVars.add nm
+      tupleFloatIdx.add fis
   e.emit("let " & nm)
   if sh.hasInit:
     var ic = sh.init
@@ -1136,6 +1212,7 @@ proc jsPrelude*(): string =
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
   e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
+  e.emit("function __sf(x){ return Number.isInteger(x) ? x + '.0' : String(x); }\n")
   if faithfulMode:
     # faithful: a bare int literal argument is a `number`, but the seq may hold
     # `bigint` elements — coerce so a later `sum + xs[i]` doesn't mix the two.
