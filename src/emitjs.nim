@@ -1204,12 +1204,45 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
     emitStmt(e, n); e.emit("\n}")
   consumeParRi n
 
+proc emitTry(e: var JsEmitter; n: var Cursor) =
+  ## (try BODY (except …)… (fin STMTS)?) — the lowering nimony emits for `defer`
+  ## (a bare `try … (fin …)`) and for `try/except/finally`. Maps to JS
+  ## `try { BODY } catch(_ex){ … } finally { … }`. The `fin` clause runs on every
+  ## exit path (including a `return` inside BODY), matching nimony `defer`/finally.
+  inc n
+  e.emit("try {\n")
+  emitStmt(e, n)                       # the protected body (a stmts block)
+  e.emit("\n}")
+  while n.kind != ParRi:
+    if n.kind == ParLe and n.tagEnum == ExceptTagId:
+      # (except <type/binding headers…> BODY) — JS has one dynamic catch binding, so
+      # collapse every except branch's body into a single catch (best effort: the
+      # exception type match and the bound variable are dropped).
+      inc n
+      e.emit(" catch(_ex) {\n")
+      while n.kind != ParRi:
+        if n.kind == ParLe and n.tagEnum == StmtsTagId: emitStmt(e, n)
+        else: skip n
+      e.emit("\n}")
+      consumeParRi n
+    elif n.kind == ParLe and n.tagEnum == FinTagId:
+      inc n
+      e.emit(" finally {\n")
+      emitStmt(e, n)
+      e.emit("\n}")
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    else:
+      skip n
+  consumeParRi n
+
 proc emitStmt(e: var JsEmitter; n: var Cursor) =
   if n.kind != ParLe:
     inc n
     return
   let t = n.tagEnum
   if t == StmtsTagId: emitStmts(e, n)
+  elif t == TryTagId: emitTry(e, n)
   elif t == VarTagId or t == LetTagId or t == ConstTagId or t == GvarTagId or
        t == GletTagId or t == ResultTagId: emitLocal(e, n)
   elif t == AsgnTagId: emitAsgn(e, n)
