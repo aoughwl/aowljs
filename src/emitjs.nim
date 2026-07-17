@@ -784,6 +784,33 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         e.emit("(" & setExpr & ".has(" & exprToStr(n) & "))")
       while n.kind != ParRi: skip n
       consumeParRi n
+    elif t == CardTagId:                          # card(set) -> element count
+      inc n; skip n                               # (card TYPE SET) -> SET.size
+      if faithfulMode: e.emit("BigInt(")
+      e.emit("("); emitExpr(e, n); e.emit(".size)")
+      if faithfulMode: e.emit(")")
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == PlussetTagId or t == MinussetTagId or t == MulsetTagId or
+         t == XorsetTagId:
+      # (plusset/minusset/mulset/xorset TYPE A B) — set algebra over JS `Set`s.
+      # union: keep A + all of B; difference: A minus B; intersection: A ∩ B;
+      # symmetric difference: elements in exactly one. Each builds a fresh Set so
+      # the operands are never mutated.
+      inc n; skip n                               # set type
+      let body =
+        if t == PlussetTagId:
+          "const _r = new Set(_a); for(const _x of _b) _r.add(_x); return _r;"
+        elif t == MinussetTagId:
+          "const _r = new Set(_a); for(const _x of _b) _r.delete(_x); return _r;"
+        elif t == MulsetTagId:
+          "const _r = new Set(); for(const _x of _a) if(_b.has(_x)) _r.add(_x); return _r;"
+        else:
+          "const _r = new Set(_a); for(const _x of _b){ if(_r.has(_x)) _r.delete(_x); else _r.add(_x); } return _r;"
+      e.emit("(function(_a,_b){ " & body & " })(")
+      emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+      while n.kind != ParRi: skip n
+      consumeParRi n
     elif t == SufTagId:
       inc n                                     # (suf LIT "suffix") -> LIT
       var big = wantBig
