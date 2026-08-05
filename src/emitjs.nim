@@ -666,6 +666,11 @@ proc looksFloat(c: Cursor): bool =
     if nm == "sqrt" or nm == "pow" or nm == "sin" or nm == "cos" or nm == "tan" or
        nm == "exp" or nm == "ln" or nm == "hypot" or nm == "floor" or nm == "ceil":
       return true
+    # min/max/abs are float-valued exactly when their ARGUMENT is: `min(7.5, 2.0)`
+    # printed 2 where nimony prints 2.0, because the answer happened to be whole.
+    if nm == "min" or nm == "max" or nm == "abs":
+      skip d                                   # past the callee -> first argument
+      return d.kind != ParRi and looksFloat(d)
     # a USER proc declared to return a float. Without this, `echo power(2.0, 10)`
     # printed 1024 where nimony prints 1024.0 — the whole point of the float
     # writer, missed because the list above only knew the math shims.
