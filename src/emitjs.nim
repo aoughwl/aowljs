@@ -906,7 +906,15 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("("); emitExpr(e, n); e.emit(" + "); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "chr" and magic:
-    skip n; e.emit("String.fromCharCode("); emitExpr(e, n); e.emit(")")
+    # `String.fromCharCode` takes a NUMBER and throws on a bigint, so in faithful
+    # mode — where an `int` argument is a bigint — `chr(ord(c) + 1)` died with
+    # "Cannot convert a BigInt value to a number". Number() is a no-op on a
+    # number, and a code point is always in range.
+    skip n
+    e.emit("String.fromCharCode(")
+    if faithfulMode: (e.emit("Number("); emitExpr(e, n); e.emit(")"))
+    else: emitExpr(e, n)
+    e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "ord" and magic:
     skip n; e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)")
@@ -1133,7 +1141,12 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
         elif toInt and sourceIsChar(n): (e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)"))
         elif toInt: (e.emit("Math.trunc("); emitExpr(e, n); e.emit(")"))
-        elif toChar and not sourceIsChar(n): (e.emit("String.fromCharCode("); emitExpr(e, n); e.emit(")"))
+        elif toChar and not sourceIsChar(n):
+          # same bigint hazard as the `chr` magic above
+          e.emit("String.fromCharCode(")
+          if faithfulMode: (e.emit("Number("); emitExpr(e, n); e.emit(")"))
+          else: emitExpr(e, n)
+          e.emit(")")
         else: emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -1893,6 +1906,22 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == RetTagId: emitRet(e, n)
   elif t == CaseTagId: emitCase(e, n, false)
   elif t == ForTagId: emitFor(e, n)
+  elif t == InclTagId or t == ExclTagId:
+    # `s.incl x` / `s.excl x` on a BUILTIN `set[T]` are their own tags —
+    # `(incl (set T) SET ELEM)` — not calls. emitCall has incl/excl branches, but
+    # nothing routes here, so both fell to `else: skip n` and vanished: the set
+    # was never updated and every later membership test answered about the old
+    # one. (`inset` was already handled, which is why reading worked and writing
+    # did not.)
+    let isIncl = t == InclTagId
+    inc n
+    skip n                                    # the element type
+    let sv = exprToStr(n)                     # the set
+    e.emit("(" & sv & (if isIncl: ".add(" else: ".delete("))
+    emitExpr(e, n)
+    e.emit("));")
+    while n.kind != ParRi: skip n
+    consumeParRi n
   elif t == DiscardTagId:
     # `discard f()` still CALLS f. There was no branch for this, so it fell to
     # `else: skip n` and the call — with every side effect in it — disappeared.
