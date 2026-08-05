@@ -1276,7 +1276,36 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == ExprTagId:
-      inc n; emitExpr(e, n, wantBig)            # (expr VALUE) -> VALUE
+      # `(expr STMTS… VALUE)` — the value is the LAST child, not the first. This
+      # emitted the first and skipped the rest, so `result = (if … elif … else …)`,
+      # which nimony spells `(expr (stmts) (if …))`, evaluated an EMPTY statement
+      # list and produced `undefined`. Every if-expression assigned to a result
+      # came out undefined.
+      inc n
+      var cnt = 0
+      var leadingCode = false
+      var probe = n
+      while probe.kind != ParRi:
+        var isEmpty = false
+        if probe.kind == ParLe and probe.tagEnum == StmtsTagId:
+          var q = probe; inc q
+          isEmpty = q.kind == ParRi
+        skip probe
+        inc cnt
+        # not the last child, and not an empty statement list: real code runs first
+        if probe.kind != ParRi and not isEmpty: leadingCode = true
+      if cnt == 0:
+        e.emit("undefined")
+      elif not leadingCode:
+        var idx = 0
+        while idx < cnt - 1: (skip n; inc idx)
+        emitExpr(e, n, wantBig)
+      else:
+        # statements before a value: JS has no comma-with-statements, so an IIFE
+        e.emit("(function(){ ")
+        var idx = 0
+        while idx < cnt - 1: (emitStmt(e, n); inc idx)
+        e.emit(" return "); emitExpr(e, n, wantBig); e.emit("; })()")
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == StmtsTagId:
@@ -1858,6 +1887,14 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == RetTagId: emitRet(e, n)
   elif t == CaseTagId: emitCase(e, n, false)
   elif t == ForTagId: emitFor(e, n)
+  elif t == DiscardTagId:
+    # `discard f()` still CALLS f. There was no branch for this, so it fell to
+    # `else: skip n` and the call — with every side effect in it — disappeared.
+    inc n
+    if n.kind == DotToken: inc n              # `discard` with nothing to discard
+    else: (e.emit("void ("); emitExpr(e, n); e.emit(");"))
+    while n.kind != ParRi: skip n
+    consumeParRi n
   elif t == BreakTagId: (e.emit("break;"); skip n)
   elif t == ContinueTagId: (e.emit("continue;"); skip n)
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
