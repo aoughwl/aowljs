@@ -27,7 +27,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
 fi
 
 NODE_BIN="$(command -v node || true)"
-pass=0; fail=0; total=0
+pass=0; fail=0; total=0; blocked=0
 
 run_js() {  # $1 = js file -> stdout of the emitted module
   node -e "process.stdout.write((function(){$(cat "$1")})())" 2>"$OUT/run.log"
@@ -46,6 +46,14 @@ for f in "$SRC"/*.nim; do
   if [ -z "$snif" ]; then
     echo "FAIL  $name  (no .s.nif — see $OUT/$name.build.log)"
     fail=$((fail+1)); continue
+  fi
+  # A .s.nif but no reference output is the toolchain breaking, not us: sem
+  # succeeded and a later phase died (hexer's lambdalifting asserts on a returned
+  # closure, for one). Comparing against "" would report that as OUR mismatch —
+  # and worse, an emitter that also printed nothing would score it a PASS.
+  if [ -z "$ref" ]; then
+    echo "BLOCKED  $name  (nimony produced a .s.nif but no output — see $OUT/$name.build.log)"
+    blocked=$((blocked+1)); continue
   fi
   ok=1
   for mode in fast faithful; do
@@ -72,5 +80,10 @@ for f in "$SRC"/*.nim; do
 done
 
 echo "-----------------------------------------"
-echo "aowljs corpus: $pass/$total passed, $fail failed"
+# The denominator is DECLARED: how many programs are in the corpus at all, not
+# just how many got as far as being compared. A blocked case is neither a pass
+# nor a failure of the emitter, and hiding it would let coverage shrink silently.
+progs="$(ls "$SRC"/*.nim 2>/dev/null | wc -l)"
+echo "aowljs corpus: $pass/$total passed, $fail failed, $blocked blocked"
+echo "  ($progs programs x 2 modes; blocked = nimony itself could not run it)"
 [ "$fail" -eq 0 ]
