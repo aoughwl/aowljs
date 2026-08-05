@@ -1466,6 +1466,14 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       skip n
   consumeParRi n
 
+## true iff this is a compiler-generated ARC/RTTI hook (`=destroy`, `=wasmoved`,
+## `=dup`, `=copy`, `=sink`/`=sinkh`, `=trace`) rather than a user routine that
+## merely starts with `=` — `==` being the one that matters.
+proc isArcHook(name: string): bool =
+  let b = opName(name)
+  return b == "=destroy" or b == "=wasmoved" or b == "=dup" or b == "=copy" or
+         b == "=sink" or b == "=sinkh" or b == "=trace"
+
 ## true iff a routine node carries `(typevars …)`, i.e. it is the UNINSTANTIATED
 ## generic that nimony keeps in the .s.nif as a template for later instantiation.
 ## Its body is not runnable: it mentions type variables, and its calls are
@@ -1497,13 +1505,13 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
   let sh = decodeProc(n)
   if isTemplate: return                  # decodeProc has consumed the node
   let rawName = pool.syms[sh.name]
-  # ARC/RTTI hook instances (`=destroy`/`=wasmoved`/`=dup`/`=copy`/`=sinkh`/`=trace`)
-  # are compiler-generated memory-management machinery, all named with a leading `=`.
-  # JS is garbage-collected, so they're dead weight — drop them (decodeProc already
-  # consumed the node). `=destroy` on an inheriting type sems as a `method`, which
-  # emitStmt skips already; this catches the plain-proc hooks. User procs never begin
-  # with `=`, so nothing user-defined is dropped.
-  if rawName.len > 0 and rawName[0] == '=': return
+  # ARC/RTTI hook instances are compiler-generated memory management and dead
+  # weight under a GC, so they are dropped (decodeProc has already consumed the
+  # node). They are matched BY NAME. The old test was "starts with `=`", on the
+  # reasoning that no user proc does — but `==` does, and so does any operator
+  # beginning with `=`. A user's `==` was therefore never emitted while its call
+  # sites still named it, and the program died with "___2 is not defined".
+  if isArcHook(rawName): return
   # a method's symbol is mapped to its DISPATCHER, so the overload itself has to
   # use the implementation name scanMethods reserved for it.
   var name = ""
@@ -1989,7 +1997,7 @@ proc scanMethods(n: var Cursor) =
     var c = n
     let sh = decodeProc(c)
     let raw = pool.syms[sh.name]
-    if raw.len > 0 and raw[0] != '=':          # skip the ARC hooks (=destroy & co)
+    if not isArcHook(raw):                     # by name: `==` also starts with `=`
       let key = opName(raw)
       var di = -1
       for i in 0 ..< methDispKey.len:
