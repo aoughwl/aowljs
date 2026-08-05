@@ -967,9 +967,21 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     let jsOp = (if name == "==": " === " elif name == "!=": " !== " else: " " & name & " ")
     skip n; e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "inc" and magic:
-    skip n; e.emit("("); emitExpr(e, n)
-    if n.kind != ParRi: (e.emit(" += "); emitExpr(e, n)) else: e.emit(" += 1")
+  elif (name == "inc" or name == "dec") and magic:
+    # `dec` had no branch at all — it fell through to a call to a `dec` that does
+    # not exist. And in faithful mode the STEP has to match the target's numeric
+    # kind: `inc n` on a bigint emitted `n += 1` and JS refuses to mix bigint
+    # with number ("Cannot mix BigInt and other types").
+    skip n
+    let isInc = name == "inc"
+    let tgt = n
+    let big = faithfulMode and producesBig(tgt)
+    e.emit("("); emitExpr(e, n)
+    e.emit(if isInc: " += " else: " -= ")
+    if n.kind != ParRi:
+      if big: emitBigOperand(e, n) else: emitExpr(e, n)
+    else:
+      e.emit(if big: "1n" else: "1")
     e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "&" and magic:
