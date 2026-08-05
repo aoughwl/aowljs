@@ -600,6 +600,10 @@ proc binOp(t: TagEnum): string =
   elif t == AshrTagId: " >> "
   else: ""
 
+## Routines whose declared return type is a float, so a call to one prints `7.0`
+## rather than `7`. Filled by emitProc; consulted by looksFloat.
+var floatProcs: seq[string] = @[]
+
 proc isCallTag(t: TagEnum): bool =
   t == CallTagId or t == CmdTagId or t == InfixTagId or t == PrefixTagId or t == HcallTagId
 
@@ -642,6 +646,8 @@ proc looksFloat(c: Cursor): bool =
     return listHas(floatVars, mangle(pool.syms[c.symId]))
   if c.kind != ParLe: return false
   let t = c.tagEnum
+  # Inf/-Inf/NaN are float-valued and have their own tags
+  if t == InfTagId or t == NeginfTagId or t == NanTagId: return true
   if t == TupatTagId:                          # (tupat tupleVar idx) into a float slot
     var d = c; inc d
     if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
@@ -657,8 +663,13 @@ proc looksFloat(c: Cursor): bool =
     var d = c; inc d
     let callee = if d.kind == Symbol or d.kind == SymbolDef: pool.syms[d.symId] else: ""
     let nm = opName(callee)
-    return nm == "sqrt" or nm == "pow" or nm == "sin" or nm == "cos" or nm == "tan" or
-           nm == "exp" or nm == "ln" or nm == "hypot" or nm == "floor" or nm == "ceil"
+    if nm == "sqrt" or nm == "pow" or nm == "sin" or nm == "cos" or nm == "tan" or
+       nm == "exp" or nm == "ln" or nm == "hypot" or nm == "floor" or nm == "ceil":
+      return true
+    # a USER proc declared to return a float. Without this, `echo power(2.0, 10)`
+    # printed 1024 where nimony prints 1024.0 — the whole point of the float
+    # writer, missed because the list above only knew the math shims.
+    return callee.len > 0 and listHas(floatProcs, mangle(callee))
   if t == ConvTagId or t == HconvTagId:      # float(x) / conv-to-float -> show N.0
     var d = c; inc d
     return d.kind == ParLe and d.tagEnum == FTagId
@@ -920,6 +931,12 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
       e.emit("new Array("); emitIdx(e, n); e.emit(").fill(0)")  # newSeq(n) -> n zeros
     else:
       e.emit("[]")
+    while n.kind != ParRi: skip n
+  elif name == "flushFile" or name == "flushStdout":
+    # Output is accumulated into `__out` and handed back whole at the end, so
+    # there is nothing to flush. With no branch this emitted a call to a
+    # `flushFile` that does not exist.
+    e.emit("void 0")
     while n.kind != ParRi: skip n
   elif name == "toOpenArray" and magic:
     # Passing an array/seq to an `openArray` param lowers to
@@ -1466,9 +1483,21 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       # OBJECT is a known seq, so a user field named `len` is untouched.
       let objIsSeq = isSeqVar(n)
       emitExpr(e, n)
-      let fld = mangle(pool.syms[n.symId]); inc n
-      if objIsSeq and fld == "len": e.emit(".length")
+      # Test the RAW field name, not the mangled one: mangle uniquifies, so the
+      # seq's `len` field becomes `len_3` the moment anything else claims `len` —
+      # which is exactly what happened, and it re-broke this silently.
+      let rawFld = pool.syms[n.symId]
+      let fld = mangle(rawFld); inc n
+      if objIsSeq and opName(rawFld) == "len": e.emit(".length")
       else: e.emit("." & fld)
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == InfTagId or t == NeginfTagId or t == NanTagId:
+      # `Inf` / `-Inf` / `NaN` are their own tags, not literals — they have no
+      # digits to print. With no branch they fell through to `undefined`, and the
+      # float writer then died on `undefined.toExponential`.
+      e.emit(if t == InfTagId: "Infinity" elif t == NeginfTagId: "-Infinity" else: "NaN")
+      inc n
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == BaseobjTagId:
@@ -1656,14 +1685,15 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)              # also fills curBoxed
-  # faithful: does this routine return a 64-bit int? (ret type follows params)
+  # what does this routine return? (the ret type follows the params node)
   let savedRetBig = curRetBig
   curRetBig = false
-  if faithfulMode and sh.hasParams:
+  if sh.hasParams:
     var rc = sh.params
     skip rc                                    # past (params …)
     if rc.kind != ParRi and not (rc.kind == ParLe and rc.tagEnum == StmtsTagId):
-      if int64Kind(rc) > 0: curRetBig = true
+      if faithfulMode and int64Kind(rc) > 0: curRetBig = true
+      if isFloatType(rc) and not listHas(floatProcs, name): floatProcs.add name
   if sh.hasBody:
     let kw = if isIter: "function* " else: "function "
     e.emit(kw & name & "(" & joinList(params, ", ") & "){\n")
@@ -2091,7 +2121,34 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
     else: (e.emit("void ("); emitExpr(e, n); e.emit(");"))
     while n.kind != ParRi: skip n
     consumeParRi n
-  elif t == BreakTagId: (e.emit("break;"); skip n)
+  elif t == BlockTagId:
+    # `block name: …` — there was NO branch for this, so the whole block, body
+    # and all, went to `else: skip n` and vanished. A JS labelled block is the
+    # exact equivalent, and it is what makes a labelled `break` work.
+    #
+    # This is also a lesson in how a test passes for the wrong reason: an earlier
+    # fixture had `block outer:` around two loops with a `break outer` inside and
+    # `echo "nope"` after them. Dropping the block skipped the echo — and taking
+    # the break skips it too, so the output matched and the fixture went green
+    # over code that was never emitted.
+    inc n
+    var lbl = ""
+    if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+      lbl = mangle(pool.syms[n.symId]); inc n
+    elif n.kind == DotToken: inc n
+    if lbl.len > 0: e.emit(lbl & ": {\n")
+    else: e.emit("{\n")
+    while n.kind != ParRi: emitStmt(e, n)
+    e.emit("\n}")
+    consumeParRi n
+  elif t == BreakTagId:
+    inc n
+    if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+      e.emit("break " & mangle(pool.syms[n.symId]) & ";"); inc n
+    else:
+      e.emit("break;")
+    while n.kind != ParRi: skip n
+    consumeParRi n
   elif t == ContinueTagId: (e.emit("continue;"); skip n)
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
   elif t == ProcTagId or t == FuncTagId: emitProc(e, n)
