@@ -520,8 +520,14 @@ proc jsString(s: string): string =
     of '\t': result.add "\\t"
     of '\r': result.add "\\r"
     else:
-      let b = int(ch)
-      if b < 0x20 or b == 0x7f:
+      let b = int(ch) and 0xff
+      # Every byte >= 0x80 is escaped to its OWN code unit. A nimony string is a
+      # byte string; passing UTF-8 bytes through raw let the JS engine fold them
+      # into one character, so `"h\xC3\xA9llo".len` answered 5 where nimony says 6
+      # and `ord(s[1])` answered 233 where nimony says 195. One code unit per byte
+      # makes len, indexing, slicing and iteration agree exactly; jsFlush decodes
+      # back to real text on the way out.
+      if b < 0x20 or b == 0x7f or b >= 0x80:
         result.add "\\u00"
         result.add hexDigits[(b shr 4) and 0xf]
         result.add hexDigits[b and 0xf]
@@ -2150,7 +2156,18 @@ proc jsPrelude*(): string =
 proc jsFlush*(): string =
   ## return the captured output once, at the end. (`return` at module top level is
   ## legal — Node wraps every module file in a function.)
-  result = "\nreturn __out;\n"
+  ##
+  ## `__out` is a BYTE string — one JS code unit per nimony byte, which is what
+  ## makes `len`/indexing/slicing agree with nimony (see jsString). Text has to be
+  ## put back together on the way out, or a non-ASCII string would print as the
+  ## individual bytes of its UTF-8 encoding. Only the final flush pays for it.
+  result = "\nreturn (function(){\n" &
+           "  for (let i = 0; i < __out.length; i++) if (__out.charCodeAt(i) > 0x7f) {\n" &
+           "    try { return new TextDecoder().decode(Uint8Array.from(__out, c => c.charCodeAt(0) & 0xff)); }\n" &
+           "    catch (_e) { return __out; }\n" &
+           "  }\n" &
+           "  return __out;\n" &
+           "})();\n"
 
 proc emitModuleBody*(root: var Cursor): string =
   ## emit ONE module's JS (no prelude/flush): procs float up (JS hoists function
