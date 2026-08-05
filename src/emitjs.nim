@@ -247,6 +247,20 @@ proc isInstanceSym(name: string): bool =
 proc isMagicSym(name: string): bool =
   result = name.contains("sysvq0asl") or isInstanceSym(name)
 
+## the mangled names of user `iterator`s (emitted as JS `function*` generators).
+## A `for` over one of these consumes it with `for..of`; a `for` over a collection
+## indexes it. The two are indistinguishable from the call node alone.
+var iterNames: seq[string] = @[]
+
+proc isIterCall(c: Cursor): bool =
+  var n = c
+  if n.kind == ParLe and (n.tagEnum == CallTagId or n.tagEnum == HcallTagId):
+    var p = n; inc p
+    if p.kind == Symbol or p.kind == SymbolDef:
+      for a in iterNames:
+        if a == mangle(pool.syms[p.symId]): return true
+  return false
+
 ## the mangled Obj-class name behind a `(ref X (notnil))` | `X` type node (the
 ## form `newobj`/`instanceof` reference); "" if it is not a plain symbol/ref.
 proc excRefClassName(c: Cursor): string =
@@ -1277,6 +1291,7 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false) =
   # with `=`, so nothing user-defined is dropped.
   if rawName.len > 0 and rawName[0] == '=': return
   let name = mangle(rawName)
+  if isIter: iterNames.add name
   var params: seq[string] = @[]
   let savedBoxed = curBoxed
   curBoxed = @[]
@@ -1476,6 +1491,7 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
   var cmp = " < "
   var step = "1"
   var coll = ""
+  var fromIter = false          # the iterable is a user `iterator` (a generator)
   if n.kind == ParLe and n.tagEnum == InfixTagId:
     inc n
     let op = opName(if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: "")
@@ -1498,6 +1514,7 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
       consumeParRi n
       kind = 2
     else:
+      fromIter = isIterCall(n)
       coll = collExpr(n)
   # loop variables (1 or 2), from (unpackflat (let :v …)…)
   var vars: seq[string] = @[]
@@ -1533,6 +1550,13 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
     emitStmt(e, n); e.emit("\n}")
   elif kind == 2:
     e.emit("for(let " & v0 & " = " & la & "; " & v0 & " >= " & lb & "; " & v0 & " -= " & lstep & "){\n")
+    emitStmt(e, n); e.emit("\n}")
+  elif vars.len >= 2 and fromIter:
+    # `for i, v in myIter(…)` — a generator yielding a TUPLE. The two loop vars
+    # are that tuple's elements, not (index, element): indexing a generator gave
+    # `_c.length` = undefined and the loop body never ran at all.
+    e.emit("for(let [" & vars[0] & ", " & vars[1] & "] of " & coll & "){\n")
+    if loopBig: e.emit(vars[0] & " = BigInt(" & vars[0] & ");\n")
     emitStmt(e, n); e.emit("\n}")
   elif vars.len >= 2:           # for i, x in coll -> indexed
     # faithful: a 64-bit index var is a bigint, but `_c.length` and the JS index
