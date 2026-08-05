@@ -66,7 +66,12 @@ run_case() {
     total=$((total+1))
     flag=""; [ "$mode" == faithful ] && flag="--faithful"
     if ! "$AOWLJS" $flag "$snif" > "$OUT/$name.$mode.js" 2>"$OUT/$name.$mode.emit.log"; then
-      echo "FAIL  $name/$mode  (emit crashed — see $OUT/$name.$mode.emit.log)"
+      # nimony's runtime aborts (`[Assertion Failure] …`) print to STDOUT, which
+      # here is the .js file — so the stderr log is EMPTY and the reason is
+      # sitting in the output. Show whichever one has something in it.
+      why="$(head -1 "$OUT/$name.$mode.emit.log")"
+      [ -z "$why" ] && why="$(head -c 200 "$OUT/$name.$mode.js" | tr '\n' ' ')"
+      echo "FAIL  $name/$mode  (emit crashed): $why"
       fail=$((fail+1)); ok=0; continue
     fi
     if [ -z "$NODE_BIN" ]; then
