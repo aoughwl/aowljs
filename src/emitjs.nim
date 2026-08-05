@@ -179,7 +179,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__append",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -1682,8 +1682,31 @@ proc jsPrelude*(): string =
   var e = JsEmitter(js: "")
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
-  e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
-  e.emit("function __sf(x){ return Number.isInteger(x) ? x + '.0' : String(x); }\n")
+  # `String(x)` is NOT nimony's `$float`. Both print shortest-round-trip digits,
+  # but they disagree about when to use exponent form: JS switches at 1e21 and
+  # 1e-7, nimony at 1e17 and 1e-8. So 1e17 came out "100000000000000000.0" (want
+  # "1e+17") and 1e-7 came out "1e-7" (want "0.0000001"). `Number.isInteger` also
+  # loses the sign of -0.0 and appended ".0" to an exponent ("1e+21.0").
+  # toExponential() with no argument gives exactly the shortest digits plus the
+  # decimal exponent, so the placement below is a re-layout, never a re-rounding.
+  e.emit("function __fs(x){\n" &
+         "  if (x !== x) return 'nan';\n" &
+         "  if (x === Infinity) return 'inf';\n" &
+         "  if (x === -Infinity) return '-inf';\n" &
+         "  if (x === 0) return Object.is(x, -0) ? '-0.0' : '0.0';\n" &
+         "  const ex = x.toExponential(), at = ex.indexOf('e');\n" &
+         "  const k = parseInt(ex.slice(at + 1), 10);\n" &
+         "  if (k < -7 || k > 16) return ex;\n" &
+         "  const mant = ex.slice(0, at), neg = mant[0] === '-';\n" &
+         "  const d = (neg ? mant.slice(1) : mant).replace('.', '');\n" &
+         "  let out;\n" &
+         "  if (k >= 0) out = d.length <= k + 1 ? d + '0'.repeat(k + 1 - d.length) + '.0'\n" &
+         "                                      : d.slice(0, k + 1) + '.' + d.slice(k + 1);\n" &
+         "  else out = '0.' + '0'.repeat(-k - 1) + d;\n" &
+         "  return (neg ? '-' : '') + out;\n" &
+         "}\n")
+  e.emit("function __wf(x){ __out += __fs(x); }\n")
+  e.emit("function __sf(x){ return __fs(x); }\n")
   if faithfulMode:
     # faithful: a bare int literal argument is a `number`, but the seq may hold
     # `bigint` elements — coerce so a later `sum + xs[i]` doesn't mix the two.
