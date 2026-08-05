@@ -180,7 +180,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","_base","_ret","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","_base","_ret","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -435,6 +435,11 @@ proc isSeqType(c: Cursor): bool =
     return opName(pool.syms[n.symId]) == "seq"
   return false
 
+## is this LVALUE a seq's `len` field — i.e. does it emit as `.length`? Assigning
+## to it must be a NUMBER: the inlined seq implementation writes `s.len = L`, and
+## in faithful mode L is a bigint, which JS refuses on `.length`.
+proc isSeqLenLvalue(c: Cursor): bool
+
 ## is this expression (unwrapping a leading haddr/hderef) a known seq binding?
 proc isSeqVar(c: Cursor): bool =
   var n = c
@@ -442,6 +447,17 @@ proc isSeqVar(c: Cursor): bool =
     inc n
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
     return listHas(seqVars, mangle(pool.syms[n.symId]))
+  return false
+
+proc isSeqLenLvalue(c: Cursor): bool =
+  var n = c
+  if not (n.kind == ParLe and (n.tagEnum == DotTagId or n.tagEnum == DdotTagId)):
+    return false
+  inc n
+  if not isSeqVar(n): return false
+  skip n                                     # past the object -> the field
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return opName(pool.syms[n.symId]) == "len"
   return false
 
 ## true iff a type node denotes a std/sets `HashSet`/`OrderedSet` (unwrapping
@@ -470,15 +486,25 @@ proc defaultVal(c: Cursor): string =
   of 1: return "\"\\u0000\""                 # char — nimony's default is '\0'
   of 2: return "\"\""
   else: discard
+  # In faithful mode a 64-bit int is a bigint, so its zero is `0n`. An array of
+  # them filled with plain `0` then mixed number and bigint on the first
+  # arithmetic: "Cannot mix BigInt and other types".
+  let zero = if faithfulMode: "0n" else: "0"
   case n.kind
   of Symbol, SymbolDef, Ident:
     let nm = opName(pool.syms[n.symId])
     if nm == "seq": return "[]"
     elif nm == "bool": return "false"
+    elif nm == "int" or nm == "int64" or nm == "uint" or nm == "uint64" or
+         nm == "Natural" or nm == "Positive": return zero
     return "0"
   of ParLe:
     let t = n.tagEnum
     if t == BoolTagId: return "false"
+    elif t == ITagId or t == UTagId:
+      inc n
+      if n.kind == IntLit and pool.integers[n.intId] == 64: return zero
+      return "0"
     elif t == ArrayTagId:
       inc n                                  # (array ELEM (rangetype BASE lo hi))
       let elem = defaultVal(n)
@@ -910,13 +936,44 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   elif name == "[]=" and magic:
     skip n                                   # callee
     var container = ""                       # (haddr LVAL) | LVAL
+    var isStr = false
     if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+      var probe = n; inc probe
+      isStr = (probe.kind == Symbol or probe.kind == SymbolDef or probe.kind == Ident) and
+              listHas(strVars, mangle(pool.syms[probe.symId]))
       inc n; container = exprToStr(n)
       while n.kind != ParRi: skip n
       consumeParRi n
     else:
+      isStr = (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident) and
+              listHas(strVars, mangle(pool.syms[n.symId]))
       container = exprToStr(n)
-    e.emit("(" & container & "["); emitIdx(e, n); e.emit("] = "); emitExpr(e, n); e.emit(")")
+    if isStr:
+      # A JS string is IMMUTABLE, so `s[0] = 'X'` threw "Cannot assign to read
+      # only property '0' of string". nimony strings are mutable, so rebuild.
+      let idx = exprToStr(n)
+      let i2 = if faithfulMode: "Number(" & idx & ")" else: idx
+      e.emit("(" & container & " = " & container & ".slice(0, " & i2 & ") + ")
+      emitExpr(e, n)
+      e.emit(" + " & container & ".slice((" & i2 & ") + 1))")
+    elif faithfulMode:
+      e.emit("__aset(" & container & ", "); emitIdx(e, n); e.emit(", ")
+      emitExpr(e, n); e.emit(")")
+    else:
+      e.emit("(" & container & "["); emitIdx(e, n); e.emit("] = "); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "setLen" and magic:
+    # Shrinking works through nimony's own inlined implementation, but GROWING
+    # goes to the real allocator (`allocatedSize`), which has no JS counterpart —
+    # a seq here is a plain Array. Intercepting the call avoids the whole
+    # implementation. Growth zero-fills, matching nimony; that is exact for the
+    # numeric element types and a deterministic stand-in for the rest.
+    skip n                                   # callee
+    let lv = setOperandStr(n)
+    e.emit("(function(_a, _n){ while (_a.length < _n) _a.push(0); _a.length = _n; return _a; })(" &
+           lv & ", ")
+    emitIdx(e, n)
+    e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "add" and magic:
     skip n
@@ -1409,6 +1466,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       else: emitExpr(e, n)                      # `@` on an array literal -> the array
       while n.kind != ParRi: skip n
       consumeParRi n
+    elif t == PatTagId:
+      # `(pat PTR IDX)` — pointer indexing. It shows up in the seq implementation
+      # nimony inlines for `del`/`delete`, where the pointer is the seq's `data`
+      # field; that field emits as the array itself, so this is a plain index.
+      inc n; e.emit("("); emitExpr(e, n); e.emit("["); emitIdx(e, n); e.emit("])")
+      while n.kind != ParRi: skip n
+      consumeParRi n
     elif t == AtTagId or t == ArratTagId:
       inc n; e.emit("("); emitExpr(e, n); e.emit("["); emitIdx(e, n); e.emit("])")
       while n.kind != ParRi: skip n
@@ -1520,6 +1584,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       let rawFld = pool.syms[n.symId]
       let fld = mangle(rawFld); inc n
       if objIsSeq and opName(rawFld) == "len": e.emit(".length")
+      elif objIsSeq and opName(rawFld) == "data": discard  # the seq IS the array
       else: e.emit("." & fld)
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -1852,11 +1917,28 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
     skip n                                        # RHS
     consumeParRi n
     return
+  # faithful: an INDEXED store reaches here as `(asgn (at ARR IDX) VALUE)`, not
+  # through the `[]=` magic, so it dropped a plain number into an array whose
+  # other slots are bigints and the next arithmetic said "Cannot mix BigInt and
+  # other types". Same hazard `__append` already handles for `add`.
+  if faithfulMode and n.kind == ParLe and (n.tagEnum == AtTagId or n.tagEnum == ArratTagId):
+    inc n
+    let obj = exprToStr(n)
+    let idx = exprToStr(n)
+    while n.kind != ParRi: skip n
+    consumeParRi n                             # end of the lvalue node
+    e.emit("__aset(" & obj & ", Number(" & idx & "), ")
+    emitExpr(e, n)
+    e.emit(");")
+    consumeParRi n
+    return
   # if the lvalue is a known bigint local, a bare-literal RHS must be bigint too.
   var lhsBig = false
   if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
     lhsBig = bigContains(mangle(pool.syms[n.symId]))
+  let lenLhs = faithfulMode and isSeqLenLvalue(n)
   emitExpr(e, n); e.emit(" = ")
+  if lenLhs: e.emit("Number(")     # `.length` takes a number, never a bigint
   # An assignment from an lvalue is a copy for a value type. The LHS's declared
   # type is not in reach here, so this leans on the RHS being an lvalue plus
   # `__cp` being the identity on scalars, strings and `ref`s.
@@ -1864,6 +1946,7 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   if cpRhs: e.emit("__cp(")
   if lhsBig: emitBigOperand(e, n) else: emitExpr(e, n, lhsBig)
   if cpRhs: e.emit(")")
+  if lenLhs: e.emit(")")
   e.emit(";")
   consumeParRi n
 
@@ -2152,6 +2235,10 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
     else: (e.emit("void ("); emitExpr(e, n); e.emit(");"))
     while n.kind != ParRi: skip n
     consumeParRi n
+  elif t == DestroyTagId:
+    # an explicit ARC destroy of an element, in the seq implementation nimony
+    # inlines. JS is garbage-collected; dropping it is the whole point.
+    skip n
   elif t == BlockTagId:
     # `block name: …` — there was NO branch for this, so the whole block, body
     # and all, went to `else: skip n` and vanished. A JS labelled block is the
@@ -2435,6 +2522,12 @@ proc jsPrelude*(): string =
     e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; " &
            "if(typeof x === 'number' && c.length > 0 && typeof c[0] === 'bigint') x = BigInt(x); " &
            "c.push(x); return c; }\n")
+    # Same coercion for an INDEXED store. `var a: array[3, int]` fills with 0n in
+    # this mode, and `a[1] = 10` then put a plain number beside them — the next
+    # `total + a[i]` is "Cannot mix BigInt and other types".
+    e.emit("function __aset(a, i, v){ " &
+           "if(typeof v === 'number' && a.length > 0 && typeof a[0] === 'bigint') v = BigInt(v); " &
+           "a[i] = v; return v; }\n")
   else:
     e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; c.push(x); return c; }\n")
   if faithfulMode:
