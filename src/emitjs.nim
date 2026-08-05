@@ -158,6 +158,10 @@ var curRetBig: bool = false
 ## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
 var curBigParams: seq[string] = @[]
 
+## by-value params of a VALUE type (object/tuple/array/seq/set): the callee gets
+## its own copy, so writing to one must not reach the caller's argument.
+var curCopyParams: seq[string] = @[]
+
 ## JS/TS reserved words that can't stand as a bare identifier — a pretty name that
 ## lands on one is prefixed with `_`.
 var jsReserved: seq[string] = @["if","for","class","return","function","var","let",
@@ -179,7 +183,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","_base","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","_base","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -302,6 +306,48 @@ proc typeKeyOf(c: Cursor): string =
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
     return prettyBase(pool.syms[n.symId])
   return ""
+
+## Does a value of this type need copy-on-assign? nimony objects, tuples, arrays,
+## seqs and sets are VALUE types; the JS objects and arrays they map onto are
+## references, so a bare `var b = a` aliased them and a later `b.x = …` was
+## visible through `a`. Scalars need no copy, strings are immutable in JS, and a
+## `ref` must NOT be copied. When the type is not recognised the answer is YES:
+## `__cp` is the identity on anything that turns out not to have needed it, so
+## over-answering costs a call and under-answering is a wrong result.
+proc copyNeeded(c: Cursor): bool =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
+    inc n
+  case n.kind
+  of ParLe:
+    let t = n.tagEnum
+    return not (t == RefTagId or t == PtrTagId or t == ITagId or t == UTagId or
+                t == FTagId or t == CTagId or t == BoolTagId or t == StringTagId or
+                t == CstringTagId or t == EnumTagId or t == ProctypeTagId)
+  of Symbol, SymbolDef, Ident:
+    let nm = opName(pool.syms[n.symId])
+    return not (nm == "int" or nm == "int8" or nm == "int16" or nm == "int32" or
+                nm == "int64" or nm == "uint" or nm == "uint8" or nm == "uint16" or
+                nm == "uint32" or nm == "uint64" or nm == "float" or nm == "float32" or
+                nm == "float64" or nm == "char" or nm == "bool" or nm == "string" or
+                nm == "cstring" or nm == "Natural" or nm == "Positive")
+  else:
+    return false
+
+## Is this expression an LVALUE — something that names storage someone else can
+## still reach? Those are what have to be copied on assignment. A literal, a
+## constructor or an arithmetic result is already a fresh value.
+proc isLvalueExpr(c: Cursor): bool =
+  var n = c
+  case n.kind
+  of Symbol, SymbolDef, Ident: return true
+  of ParLe:
+    let t = n.tagEnum
+    return t == DotTagId or t == DdotTagId or t == AtTagId or t == ArratTagId or
+           t == TupatTagId or t == HderefTagId or t == HaddrTagId or t == DerefTagId or
+           t == ExprTagId
+  else: return false
 
 proc objBaseOf(t: string): string =
   for i in 0 ..< objTypeNames.len:
@@ -817,7 +863,13 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   elif name == "add" and magic:
     skip n
     let lv = exprToStr(n)                    # target: seq push, or string reassign
-    e.emit("(" & lv & " = __append(" & lv & ", "); emitExpr(e, n); e.emit("))")
+    e.emit("(" & lv & " = __append(" & lv & ", ")
+    # `s.add p` stores a COPY of p; otherwise a later `p.x = …` reaches into the seq
+    let cpv = isLvalueExpr(n)
+    if cpv: e.emit("__cp(")
+    emitExpr(e, n)
+    if cpv: e.emit(")")
+    e.emit("))")
     while n.kind != ParRi: skip n
   elif (name == "newSeq" or name == "newSeqUninit" or name == "newSeqOfCap" or
        name == "newSeqUninitialized") and magic:
@@ -1261,9 +1313,16 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       if isExc: e.emit("new " & cls & "(")
       e.emit("({")
       var first = true
+      # `newobj` is the `ref object` construction. Marking it stops __cp from
+      # deep-copying a reference — which would give every binding its own object
+      # and quietly break identity, the exact opposite of the aliasing bug.
+      if t == NewobjTagId:
+        e.emit("__ref: 1")
+        first = false
       # a type that participates in method dispatch carries its own name, because
       # a plain object literal has nothing else to dispatch on.
       if not isExc and tkey.len > 0 and dispatchesOn(tkey):
+        if not first: e.emit(", ")      # a ref object carries BOTH markers
         e.emit("__t: " & jsString(tkey))
         first = false
       while n.kind != ParRi:
@@ -1347,6 +1406,10 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       else: discard
       if isSetType(typeCur): setAdd pnm        # HashSet param -> native JS Set
       if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
+      # A by-value param of a value type is the callee's OWN copy: mutating it
+      # must not reach the caller's variable. JS passed the same object, so
+      # `proc f(p: P) = p.x = 1` wrote straight through the argument.
+      if not byRef and copyNeeded(typeCur): curCopyParams.add pnm
       skip n                       # type
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -1405,6 +1468,8 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
   curBoxed = @[]
   let savedBigParams = curBigParams
   curBigParams = @[]
+  let savedCopyParams = curCopyParams
+  curCopyParams = @[]
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)              # also fills curBoxed
@@ -1423,12 +1488,16 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
     # can't mix with bigint arithmetic inside the body. BigInt() is a no-op on an
     # existing bigint, so typed callers are unaffected.
     for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
+    # take ownership of by-value aggregates at entry, once, rather than at every
+    # call site — a caller cannot know whether the callee writes to them.
+    for cp in curCopyParams: e.emit("  " & cp & " = __cp(" & cp & ");\n")
     var bc = sh.body
     emitStmts(e, bc)
     e.emit("\n}\n")
   curRetBig = savedRetBig
   curBoxed = savedBoxed
   curBigParams = savedBigParams
+  curCopyParams = savedCopyParams
 
 proc emitArrow(e: var JsEmitter; n: var Cursor) =
   ## Emit an anonymous/nested (proc …) as a JS arrow function value:
@@ -1442,6 +1511,8 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
   curBoxed = @[]
   let savedBigParams = curBigParams
   curBigParams = @[]
+  let savedCopyParams = curCopyParams
+  curCopyParams = @[]
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)
@@ -1454,6 +1525,7 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
       if int64Kind(rc) > 0: curRetBig = true
   e.emit("(" & joinList(params, ", ") & ") => {\n")
   for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
+  for cp in curCopyParams: e.emit("  " & cp & " = __cp(" & cp & ");\n")
   if sh.hasBody:
     var bc = sh.body
     emitStmts(e, bc)
@@ -1461,6 +1533,7 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
   curRetBig = savedRetBig
   curBoxed = savedBoxed
   curBigParams = savedBigParams
+  curCopyParams = savedCopyParams
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
   ## (var/let/const/result NAME EXPORT PRAGMAS TYPE VALUE) — fixed positional
@@ -1499,7 +1572,12 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
     # field, a call result) — and then every later use is a lie that surfaces far
     # away as "Cannot convert 3 to a BigInt". Coerce at the binding.
     e.emit(" = ")
+    # `var b = a` over a value type has to copy; a constructor or a computed
+    # value is already fresh, so only an LVALUE needs it.
+    let cp = not big and copyNeeded(sh.typ) and isLvalueExpr(ic)
+    if cp: e.emit("__cp(")
     if big: emitBigOperand(e, ic) else: emitExpr(e, ic, big)
+    if cp: e.emit(")")
   elif big:
     e.emit(" = 0n")
   else:
@@ -1527,7 +1605,13 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
     lhsBig = bigContains(mangle(pool.syms[n.symId]))
   emitExpr(e, n); e.emit(" = ")
+  # An assignment from an lvalue is a copy for a value type. The LHS's declared
+  # type is not in reach here, so this leans on the RHS being an lvalue plus
+  # `__cp` being the identity on scalars, strings and `ref`s.
+  let cpRhs = not lhsBig and isLvalueExpr(n)
+  if cpRhs: e.emit("__cp(")
   if lhsBig: emitBigOperand(e, n) else: emitExpr(e, n, lhsBig)
+  if cpRhs: e.emit(")")
   e.emit(";")
   consumeParRi n
 
@@ -2004,6 +2088,19 @@ proc jsPrelude*(): string =
          "}\n")
   e.emit("function __wf(x){ __out += __fs(x); }\n")
   e.emit("function __sf(x){ return __fs(x); }\n")
+  # Copy-on-assign. A nimony object/tuple/array/seq/set is a VALUE: `var b = a`
+  # then `b.x = 1` must not be visible through `a`. JS shares the reference, so
+  # every one of those assignments was silently aliasing. `__ref` marks an object
+  # built by `newobj` — a `ref object`, which has reference semantics and must be
+  # shared, not copied — and is what lets one structural copier serve both.
+  e.emit("function __cp(v){\n" &
+         "  if (v === null || typeof v !== 'object' || v.__ref) return v;\n" &
+         "  if (Array.isArray(v)) { const r = new Array(v.length);\n" &
+         "    for (let i = 0; i < v.length; i++) r[i] = __cp(v[i]); return r; }\n" &
+         "  if (v instanceof Set) return new Set(v);\n" &
+         "  if (v instanceof Map) return new Map(v);\n" &
+         "  const o = {}; for (const k in v) o[k] = __cp(v[k]); return o;\n" &
+         "}\n")
   if faithfulMode:
     # faithful: a bare int literal argument is a `number`, but the seq may hold
     # `bigint` elements — coerce so a later `sum + xs[i]` doesn't mix the two.
