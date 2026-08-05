@@ -158,9 +158,6 @@ var curRetBig: bool = false
 ## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
 var curBigParams: seq[string] = @[]
 
-## by-value params of a VALUE type (object/tuple/array/seq/set): the callee gets
-## its own copy, so writing to one must not reach the caller's argument.
-var curCopyParams: seq[string] = @[]
 
 ## JS/TS reserved words that can't stand as a bare identifier — a pretty name that
 ## lands on one is prefixed with `_`.
@@ -1406,10 +1403,12 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       else: discard
       if isSetType(typeCur): setAdd pnm        # HashSet param -> native JS Set
       if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
-      # A by-value param of a value type is the callee's OWN copy: mutating it
-      # must not reach the caller's variable. JS passed the same object, so
-      # `proc f(p: P) = p.x = 1` wrote straight through the argument.
-      if not byRef and copyNeeded(typeCur): curCopyParams.add pnm
+      # NOTE: a by-value param needs NO copy on entry. nimony rejects mutating one
+      # ("cannot mutate expression p.x"), so the callee cannot write through it,
+      # and it cannot hand it to a `var` param either. Copying every aggregate
+      # argument at every call would have been O(n) per call for nothing. What
+      # does need the copy is `var q = p` inside the body — a binding, handled
+      # where bindings are.
       skip n                       # type
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -1468,8 +1467,6 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
   curBoxed = @[]
   let savedBigParams = curBigParams
   curBigParams = @[]
-  let savedCopyParams = curCopyParams
-  curCopyParams = @[]
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)              # also fills curBoxed
@@ -1490,14 +1487,12 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
     for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
     # take ownership of by-value aggregates at entry, once, rather than at every
     # call site — a caller cannot know whether the callee writes to them.
-    for cp in curCopyParams: e.emit("  " & cp & " = __cp(" & cp & ");\n")
     var bc = sh.body
     emitStmts(e, bc)
     e.emit("\n}\n")
   curRetBig = savedRetBig
   curBoxed = savedBoxed
   curBigParams = savedBigParams
-  curCopyParams = savedCopyParams
 
 proc emitArrow(e: var JsEmitter; n: var Cursor) =
   ## Emit an anonymous/nested (proc …) as a JS arrow function value:
@@ -1511,8 +1506,6 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
   curBoxed = @[]
   let savedBigParams = curBigParams
   curBigParams = @[]
-  let savedCopyParams = curCopyParams
-  curCopyParams = @[]
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)
@@ -1525,7 +1518,6 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
       if int64Kind(rc) > 0: curRetBig = true
   e.emit("(" & joinList(params, ", ") & ") => {\n")
   for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
-  for cp in curCopyParams: e.emit("  " & cp & " = __cp(" & cp & ");\n")
   if sh.hasBody:
     var bc = sh.body
     emitStmts(e, bc)
@@ -1533,7 +1525,6 @@ proc emitArrow(e: var JsEmitter; n: var Cursor) =
   curRetBig = savedRetBig
   curBoxed = savedBoxed
   curBigParams = savedBigParams
-  curCopyParams = savedCopyParams
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
   ## (var/let/const/result NAME EXPORT PRAGMAS TYPE VALUE) — fixed positional
