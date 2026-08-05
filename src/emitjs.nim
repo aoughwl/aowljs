@@ -180,7 +180,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","_base","_ret","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","__eq","_base","_ret","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -793,6 +793,15 @@ proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
   ## unsigned type must be JS `>>>`: `>>` sign-extends, which turned
   ## `4000000000'u32 shr 8` into -1152216 instead of 15625000.
   inc n
+  # `==`/`!=` over an AGGREGATE is a value comparison, not a reference one. The
+  # type node is right here, so the `__eq` call is only paid where it is needed —
+  # scalars, strings, enums and refs keep the native operator.
+  if (t == EqTagId or t == NeqTagId) and copyNeeded(n):
+    skip n                        # the type node
+    if t == NeqTagId: e.emit("!")
+    e.emit("__eq("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+    consumeParRi n
+    return
   var width = 0
   var unsigned = false
   var big64 = 0                   # 0=no, 1=signed, 2=unsigned (faithful mode)
@@ -1025,9 +1034,19 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   elif (name == "==" or name == "!=" or name == "<" or name == "<=" or
         name == ">" or name == ">=") and magic:
     # operator-overload comparison emitted as a call (e.g. string ==/</>): JS
-    # strings compare lexicographically, so map to the native operator.
-    let jsOp = (if name == "==": " === " elif name == "!=": " !== " else: " " & name & " ")
-    skip n; e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
+    # strings compare lexicographically, so `<`/`<=`/`>`/`>=` map to the native
+    # operator. `==`/`!=` do NOT: this is the path an aggregate takes — nimony
+    # spells it `(infix ==.23.I… a b)`, a generic instance — and `===` on an
+    # object or array is REFERENCE equality, so two separately-built equal values
+    # compared unequal. __eq starts with `a === b`, so a string or a number pays
+    # only the call.
+    if name == "==" or name == "!=":
+      skip n
+      if name == "!=": e.emit("!")
+      e.emit("__eq("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+    else:
+      let jsOp = " " & name & " "
+      skip n; e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif (name == "inc" or name == "dec") and magic:
     # `dec` had no branch at all — it fell through to a call to a `dec` that does
@@ -2507,6 +2526,29 @@ proc jsPrelude*(): string =
          "  if (v instanceof Set) return new Set(v);\n" &
          "  if (v instanceof Map) return new Map(v);\n" &
          "  const o = {}; for (const k in v) o[k] = __cp(v[k]); return o;\n" &
+         "}\n")
+  # Structural equality. nimony compares an object/tuple/array/seq/set by VALUE;
+  # JS `===` on those compares REFERENCES, so two separately-built equal values
+  # were unequal — `P(x:1,y:2) == P(x:1,y:2)` was false, and so was every search
+  # through a container built on it. `__ref` marks a `ref object`, which compares
+  # by identity in nimony too, so it stops here rather than being walked.
+  e.emit("function __eq(a, b){\n" &
+         "  if (a === b) return true;\n" &
+         "  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;\n" &
+         "  if (a.__ref || b.__ref) return false;\n" &
+         "  if (Array.isArray(a) !== Array.isArray(b)) return false;\n" &
+         "  if (Array.isArray(a)) {\n" &
+         "    if (a.length !== b.length) return false;\n" &
+         "    for (let i = 0; i < a.length; i++) if (!__eq(a[i], b[i])) return false;\n" &
+         "    return true; }\n" &
+         "  if (a instanceof Set || b instanceof Set) {\n" &
+         "    if (!(a instanceof Set) || !(b instanceof Set) || a.size !== b.size) return false;\n" &
+         "    for (const v of a) if (!b.has(v)) return false;\n" &
+         "    return true; }\n" &
+         "  const ka = Object.keys(a), kb = Object.keys(b);\n" &
+         "  if (ka.length !== kb.length) return false;\n" &
+         "  for (const k of ka) if (!(k in b) || !__eq(a[k], b[k])) return false;\n" &
+         "  return true;\n" &
          "}\n")
   # `x of T`. An exception type is a real JS class and uses `instanceof`; every
   # other object is a plain literal, so the test walks the `__t` tag up `_base`.
