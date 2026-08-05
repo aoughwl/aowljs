@@ -1056,6 +1056,20 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   elif name == "split":
     skip n; e.emit("("); emitExpr(e, n); e.emit(").split("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
+  elif name == "find":
+    # `find` returns the index or -1, which is exactly `indexOf` — and it works
+    # for a seq receiver as well as a string, since JS arrays have it too.
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").indexOf("); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "replace":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(").replaceAll(")
+    emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "capitalizeAscii":
+    skip n
+    e.emit("(function(_v){ return _v.length ? _v[0].toUpperCase() + _v.slice(1) : _v; })(")
+    emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
   elif name == "contains" or name == "startsWith" or name == "endsWith":
     let jn = if name == "contains": "includes" else: name
     skip n; e.emit("("); emitExpr(e, n); e.emit(")." & jn & "("); emitExpr(e, n); e.emit(")")
