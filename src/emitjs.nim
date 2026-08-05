@@ -510,24 +510,46 @@ proc emitStmts(e: var JsEmitter; n: var Cursor) =
   consumeParRi n
 
 proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
-  ## (op TYPE a b) -> (a op b). For 32-bit add/sub/mul, wrap on overflow
-  ## (Math.imul / `| 0`) so hashing is exact; default 64-bit stays plain.
+  ## (op TYPE a b) -> (a op b). A narrow machine int has to be renormalised after
+  ## the op, because JS is not one: `+`/`*` grow past the width, and every bitwise
+  ## op yields a *signed 32-bit* number. So an unsigned type gets `>>> 0` (u32) or
+  ## a mask, and a narrow signed type a sign-extending shift pair. `shr` on an
+  ## unsigned type must be JS `>>>`: `>>` sign-extends, which turned
+  ## `4000000000'u32 shr 8` into -1152216 instead of 15625000.
   inc n
-  var imul = false
-  var wrap32 = false
+  var width = 0
+  var unsigned = false
   var big64 = 0                   # 0=no, 1=signed, 2=unsigned (faithful mode)
   if n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
+    unsigned = n.tagEnum == UTagId
     var d = n; inc d
-    let width = if d.kind == IntLit: pool.integers[d.intId] else: 0
-    if width == 32 and (t == AddTagId or t == SubTagId or t == MulTagId):
-      if t == MulTagId: imul = true else: wrap32 = true
-    elif width == 64 and faithfulMode:
-      big64 = if n.tagEnum == ITagId: 1 else: 2
+    if d.kind == IntLit: width = int(pool.integers[d.intId])
+    if width == 64 and faithfulMode:
+      big64 = if unsigned: 2 else: 1
   skip n                          # the type node
-  if imul:
-    e.emit("Math.imul("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
-  elif wrap32:
-    e.emit("(("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(") | 0)")
+  var jsOp = op
+  if unsigned and width > 0 and width <= 32 and t == ShrTagId:
+    jsOp = " >>> "
+  let narrow = width > 0 and width <= 32 and
+               (t == AddTagId or t == SubTagId or t == MulTagId or t == ShlTagId or
+                t == BitandTagId or t == BitorTagId or t == BitxorTagId)
+  if narrow:
+    var pre = "("
+    var post = ""
+    if unsigned:
+      if width == 32: post = " >>> 0)"
+      elif width == 16: post = " & 0xFFFF)"
+      else: post = " & 0xFF)"
+    else:
+      if width == 32: post = " | 0)"
+      elif width == 16: pre = "(("; post = " << 16) >> 16)"
+      else: pre = "(("; post = " << 24) >> 24)"
+    e.emit(pre)
+    if t == MulTagId:
+      e.emit("Math.imul("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+    else:
+      e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
+    e.emit(post)
   elif big64 > 0:
     # operands must both be bigint; add/sub/mul/shl and the bitwise ops can exceed
     # the 64-bit range so wrap them, comparisons and >> stay bare.
@@ -538,7 +560,7 @@ proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
     emitExpr(e, n, true); e.emit(op); emitExpr(e, n, true)
     e.emit(")")
   else:
-    e.emit("("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(")")
+    e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
   consumeParRi n
 
 ## emit an array index. In faithful mode an index may be a `bigint` (64-bit int),

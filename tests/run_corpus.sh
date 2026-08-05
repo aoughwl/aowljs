@@ -19,6 +19,13 @@ NC="/tmp/aowljs-corpus-nc"
 OUT="$HERE/_out_corpus"
 rm -rf "$NC"; mkdir -p "$NC" "$OUT"
 
+# Rebuild the emitter first. Without this the gate happily tests a stale binary —
+# bin/aowljs was once a whole commit behind src/emitjs.nim and every run was green.
+if [ "${SKIP_BUILD:-0}" != 1 ]; then
+  bash "$ROOT/build.sh" >"$OUT/build.log" 2>&1 || {
+    echo "FAIL  build  (see $OUT/build.log)"; exit 1; }
+fi
+
 NODE_BIN="$(command -v node || true)"
 pass=0; fail=0; total=0
 
