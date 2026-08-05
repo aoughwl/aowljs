@@ -566,6 +566,17 @@ proc emitStmts(e: var JsEmitter; n: var Cursor) =
   while n.kind != ParRi: emitStmt(e, n)
   consumeParRi n
 
+proc emitBigOperand(e: var JsEmitter; n: var Cursor) =
+  ## An operand of a 64-bit op in faithful mode. `wantBig` only suffixes an int
+  ## *literal*; anything the emitter can't prove is already a bigint — a tuple
+  ## slot, a field, a call result — arrives as a plain `number` and makes
+  ## `BigInt.asIntN` throw "Cannot convert 3 to a BigInt". `BigInt(x)` is the
+  ## identity on a bigint, so coercing whatever we can't prove costs nothing.
+  if n.kind == IntLit or n.kind == UIntLit or producesBig(n):
+    emitExpr(e, n, true)
+  else:
+    e.emit("BigInt("); emitExpr(e, n, true); e.emit(")")
+
 proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
   ## (op TYPE a b) -> (a op b). A narrow machine int has to be renormalised after
   ## the op, because JS is not one: `+`/`*` grow past the width, and every bitwise
@@ -614,7 +625,7 @@ proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
                    t == BitandTagId or t == BitorTagId or t == BitxorTagId
     let wrapper = if big64 == 1: "_i64" else: "_u64"
     if needWrap: e.emit(wrapper & "(") else: e.emit("(")
-    emitExpr(e, n, true); e.emit(op); emitExpr(e, n, true)
+    emitBigOperand(e, n); e.emit(op); emitBigOperand(e, n)
     e.emit(")")
   else:
     e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
@@ -1360,7 +1371,12 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   e.emit("let " & nm)
   if sh.hasInit:
     var ic = sh.init
-    e.emit(" = "); emitExpr(e, ic, big)
+    # A local declared `int`/`int64` is registered as a bigint on the strength of
+    # its TYPE, but its initializer can still be a plain `number` (a tuple slot, a
+    # field, a call result) — and then every later use is a lie that surfaces far
+    # away as "Cannot convert 3 to a BigInt". Coerce at the binding.
+    e.emit(" = ")
+    if big: emitBigOperand(e, ic) else: emitExpr(e, ic, big)
   elif big:
     e.emit(" = 0n")
   else:
@@ -1387,7 +1403,9 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   var lhsBig = false
   if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
     lhsBig = bigContains(mangle(pool.syms[n.symId]))
-  emitExpr(e, n); e.emit(" = "); emitExpr(e, n, lhsBig); e.emit(";")
+  emitExpr(e, n); e.emit(" = ")
+  if lhsBig: emitBigOperand(e, n) else: emitExpr(e, n, lhsBig)
+  e.emit(";")
   consumeParRi n
 
 proc emitIf(e: var JsEmitter; n: var Cursor) =
