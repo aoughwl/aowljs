@@ -1053,7 +1053,12 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         emitExpr(e, n, wantBig)
       while n.kind != ParRi: skip n
       consumeParRi n
-    elif t == ConvTagId or t == HconvTagId:
+    elif t == ConvTagId or t == HconvTagId or t == DconvTagId:
+      # `dconv` is the DISTINCT conversion, and it had no handler at all — it fell
+      # through to the `undefined` fallback, which is how a `{.borrow.}`ed operator
+      # (whose whole body is `result = (dconv T (add … (dconv (i 64) a) …))`)
+      # came out as a function returning undefined. A distinct type IS its
+      # underlying representation in JS, so it converts exactly like `conv`.
       inc n                                     # (conv TYPE VALUE) -> VALUE
       let targetK = if faithfulMode: int64Kind(n) else: 0
       let toInt = n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId)
@@ -1205,7 +1210,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       let opsym = if n.kind == Symbol or n.kind == Ident: pool.syms[n.symId] else: ""
       let op = opName(opsym)
       inc n
-      if op == "$":
+      if op == "$" and opsym.len > 0 and not isMagicSym(opsym):
+        # A USER `$` for this type. `String(x)` here quietly ignored it and
+        # printed the underlying representation instead — and for a `{.borrow.}`d
+        # distinct that is `undefined`. The `$` branch elsewhere in emitCall is
+        # guarded by `magic`; this one was not.
+        e.emit(mangle(opsym) & "("); emitExpr(e, n); e.emit(")")
+      elif op == "$":
         if looksFloat(n): (e.emit("__sf("); emitExpr(e, n); e.emit(")"))
         else: (e.emit("String("); emitExpr(e, n); e.emit(")"))
       else: emitExpr(e, n)                      # `@` on an array literal -> the array
@@ -1345,13 +1356,36 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       skip n
   consumeParRi n
 
+## true iff a routine node carries `(typevars …)`, i.e. it is the UNINSTANTIATED
+## generic that nimony keeps in the .s.nif as a template for later instantiation.
+## Its body is not runnable: it mentions type variables, and its calls are
+## unresolved — the callee is `(at SYM TYPEARGS)` rather than a symbol, which no
+## handler here consumes, so walking it desynchronised the cursor and aborted the
+## whole emit with `consumeParRi: cursor not at ParRi`. Every instantiation is
+## emitted separately under its own symbol, so dropping the template loses
+## nothing; emitting it produced JS that could only have referenced `T`.
+proc hasTypevars(c: Cursor): bool =
+  var n = c
+  if n.kind != ParLe: return false
+  inc n                          # NAME export pragmas [typevars] params …
+  var guard = 0
+  while n.kind != ParRi and guard < 8:
+    if n.kind == ParLe:
+      if n.tagEnum == TypevarsTagId: return true
+      if n.tagEnum == ParamsTagId: return false
+    skip n
+    inc guard
+  return false
+
 proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false) =
   ## (proc :name … (params …) RETTYPE … (stmts BODY)). Shape via hlwalk.decodeProc;
   ## params come before the body in the grammar, so collect (filling curBoxed)
   ## then emit — a forward decl (no stmts) emits nothing, as before.
   ## `isIter` marks an (iterator …) routine, emitted as a JS `function*` generator
   ## (its `(yld v)` bodies become `yield v`); a `for x in it(…)` then `for..of`s it.
+  let isTemplate = hasTypevars(n)
   let sh = decodeProc(n)
+  if isTemplate: return                  # decodeProc has consumed the node
   let rawName = pool.syms[sh.name]
   # ARC/RTTI hook instances (`=destroy`/`=wasmoved`/`=dup`/`=copy`/`=sinkh`/`=trace`)
   # are compiler-generated memory-management machinery, all named with a leading `=`.
