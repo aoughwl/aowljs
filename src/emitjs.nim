@@ -180,7 +180,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","_base","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","_base","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -351,8 +351,7 @@ proc objBaseOf(t: string): string =
     if objTypeNames[i] == t: return objTypeBases[i]
   return ""
 
-## does `t`, or anything it inherits from, have a method? Only those types need a
-## `__t` tag — tagging everything would put the field on every Table/HashSet node.
+## does `t`, or anything it inherits from, have a method?
 proc dispatchesOn(t: string): bool =
   var cur = t
   var guard = 0
@@ -362,6 +361,21 @@ proc dispatchesOn(t: string): bool =
     cur = objBaseOf(cur)
     inc guard
   return false
+
+## does `t` take part in an inheritance hierarchy at all — as a derived type or
+## as somebody's base? `x of T` needs the runtime tag just as much as method
+## dispatch does, and a hierarchy with no methods in it has one too. Types
+## outside any hierarchy stay untagged, so a Table/HashSet node does not grow a
+## field it has no use for.
+proc inHierarchy(t: string): bool =
+  if t.len == 0: return false
+  for i in 0 ..< objTypeNames.len:
+    if objTypeNames[i] == t and objTypeBases[i].len > 0: return true
+    if objTypeBases[i] == t: return true
+  return false
+
+proc needsTypeTag(t: string): bool =
+  dispatchesOn(t) or inHierarchy(t)
 
 proc methImplFor(sym: string): string =
   for i in 0 ..< methImplSym.len:
@@ -1157,12 +1171,23 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == InstanceofTagId:
-      # (instanceof VALUE TYPE) -> `VALUE instanceof Class` (exception dispatch).
+      # (instanceof VALUE TYPE) — `x of T`. An EXCEPTION type is a real JS class,
+      # so `instanceof` works there. Every other object is a plain literal with no
+      # class to test against, and this emitted `x instanceof Leaf` naming a
+      # binding that does not exist: `ReferenceError: Leaf is not defined`, for
+      # the ordinary use of `of` on an ordinary hierarchy. Those go through the
+      # `__t` tag and the recorded base chain instead.
       inc n
-      emitExpr(e, n)
-      e.emit(" instanceof ")
+      var vc = n
+      skip n                                    # past VALUE -> TYPE
       let cls = excRefClassName(n)
-      e.emit(if cls.len > 0: cls else: "Object")
+      let key = typeKeyOf(n)
+      if cls.len > 0 and isExcClass(cls):
+        emitExpr(e, vc); e.emit(" instanceof " & cls)
+      elif key.len > 0:
+        e.emit("__isa("); emitExpr(e, vc); e.emit(", " & jsString(key) & ")")
+      else:
+        emitExpr(e, vc); e.emit(" instanceof Object")
       skip n
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -1366,7 +1391,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         first = false
       # a type that participates in method dispatch carries its own name, because
       # a plain object literal has nothing else to dispatch on.
-      if not isExc and tkey.len > 0 and dispatchesOn(tkey):
+      if not isExc and tkey.len > 0 and needsTypeTag(tkey):
         if not first: e.emit(", ")      # a ref object carries BOTH markers
         e.emit("__t: " & jsString(tkey))
         first = false
@@ -2034,12 +2059,14 @@ proc emitDispatchers(): string =
   ## per method name. Tables accumulate across modules and function declarations
   ## hoist, so re-emitting per module is harmless — the last, most complete
   ## definition is the one that binds.
-  if methDispName.len == 0: return ""
+  ##
+  ## `_base` is emitted whether or not there are any methods: `x of T` walks the
+  ## same chain, and a hierarchy with no methods in it still needs one.
   var e = JsEmitter(js: "")
   var pairs = ""
   var first = true
   for i in 0 ..< objTypeNames.len:
-    if objTypeBases[i].len > 0 and dispatchesOn(objTypeNames[i]):
+    if objTypeBases[i].len > 0 and needsTypeTag(objTypeNames[i]):
       if not first: pairs.add ", "
       first = false
       pairs.add jsString(objTypeNames[i]) & ": " & jsString(objTypeBases[i])
@@ -2171,6 +2198,14 @@ proc jsPrelude*(): string =
          "  if (v instanceof Set) return new Set(v);\n" &
          "  if (v instanceof Map) return new Map(v);\n" &
          "  const o = {}; for (const k in v) o[k] = __cp(v[k]); return o;\n" &
+         "}\n")
+  # `x of T`. An exception type is a real JS class and uses `instanceof`; every
+  # other object is a plain literal, so the test walks the `__t` tag up `_base`.
+  e.emit("function __isa(v, t){\n" &
+         "  if (v === null || typeof v !== 'object') return false;\n" &
+         "  let k = v.__t || '';\n" &
+         "  while (k) { if (k === t) return true; k = _base[k] || ''; }\n" &
+         "  return false;\n" &
          "}\n")
   if faithfulMode:
     # faithful: a bare int literal argument is a `number`, but the seq may hold
