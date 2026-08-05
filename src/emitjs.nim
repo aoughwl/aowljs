@@ -180,7 +180,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","__eq","_base","_ret","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","__eq","__has","__find","_base","_ret","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -1133,9 +1133,10 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("("); emitExpr(e, n); e.emit(").split("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "find":
-    # `find` returns the index or -1, which is exactly `indexOf` — and it works
-    # for a seq receiver as well as a string, since JS arrays have it too.
-    skip n; e.emit("("); emitExpr(e, n); e.emit(").indexOf("); emitExpr(e, n); e.emit(")")
+    # `indexOf` compares by reference, so an equal-but-separately-built element
+    # was never found; __find compares by value and keeps substring semantics for
+    # a string receiver.
+    skip n; e.emit("__find("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "replace":
     skip n; e.emit("("); emitExpr(e, n); e.emit(").replaceAll(")
@@ -1146,9 +1147,14 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     e.emit("(function(_v){ return _v.length ? _v[0].toUpperCase() + _v.slice(1) : _v; })(")
     emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "contains" or name == "startsWith" or name == "endsWith":
-    let jn = if name == "contains": "includes" else: name
-    skip n; e.emit("("); emitExpr(e, n); e.emit(")." & jn & "("); emitExpr(e, n); e.emit(")")
+  elif name == "contains":
+    # `.includes` is reference equality for elements, so `P(x:2,y:2) in ps` was
+    # false against an equal element built separately. __has walks with __eq and
+    # still does substring search for a string receiver.
+    skip n; e.emit("__has("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "startsWith" or name == "endsWith":
+    skip n; e.emit("("); emitExpr(e, n); e.emit(")." & name & "("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   else:
     let boxed = boxLookup(name)                # ",i,j," of boxed param positions
@@ -2534,6 +2540,8 @@ proc jsPrelude*(): string =
   # by identity in nimony too, so it stops here rather than being walked.
   e.emit("function __eq(a, b){\n" &
          "  if (a === b) return true;\n" &
+         "  if (typeof a === 'bigint' && typeof b === 'number') return Number.isInteger(b) && a === BigInt(b);\n" &
+         "  if (typeof b === 'bigint' && typeof a === 'number') return Number.isInteger(a) && b === BigInt(a);\n" &
          "  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;\n" &
          "  if (a.__ref || b.__ref) return false;\n" &
          "  if (Array.isArray(a) !== Array.isArray(b)) return false;\n" &
@@ -2549,6 +2557,20 @@ proc jsPrelude*(): string =
          "  if (ka.length !== kb.length) return false;\n" &
          "  for (const k of ka) if (!(k in b) || !__eq(a[k], b[k])) return false;\n" &
          "  return true;\n" &
+         "}\n")
+  # Membership and search go through __eq for the same reason `==` does:
+  # `.includes`/`.indexOf` compare by reference, so an equal-but-separately-built
+  # object was never found, and in faithful mode a bigint element never matched a
+  # plain number literal. A string receiver keeps substring semantics.
+  e.emit("function __has(c, v){\n" &
+         "  if (typeof c === 'string') return c.includes(v);\n" &
+         "  for (const e of c) if (__eq(e, v)) return true;\n" &
+         "  return false;\n" &
+         "}\n")
+  e.emit("function __find(c, v){\n" &
+         "  if (typeof c === 'string') return c.indexOf(v);\n" &
+         "  for (let i = 0; i < c.length; i++) if (__eq(c[i], v)) return i;\n" &
+         "  return -1;\n" &
          "}\n")
   # `x of T`. An exception type is a real JS class and uses `instanceof`; every
   # other object is a plain literal, so the test walks the `__t` tag up `_base`.
