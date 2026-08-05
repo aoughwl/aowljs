@@ -179,7 +179,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","_base","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -260,6 +260,70 @@ proc isIterCall(c: Cursor): bool =
       for a in iterNames:
         if a == mangle(pool.syms[p.symId]): return true
   return false
+
+## a fresh, reserved JS identifier derived from `base` — for names the emitter
+## invents (method dispatchers and their per-type implementations) rather than
+## mangles from a nimony symbol.
+proc uniqueJs(base: string): string =
+  let b = prettyBase(base)
+  var cand = b
+  var k = 2
+  while prettyTaken(cand):
+    cand = b & "_" & $k
+    inc k
+  renameTaken.add cand
+  return cand
+
+## user `method`s. A JS object here is a plain field bag with no prototype, so
+## dispatch cannot ride on JS's own: a value of a dispatching type carries a `__t`
+## tag naming its type, every method base name gets ONE dispatcher function, and
+## the dispatcher walks `__t` up the recorded inheritance chain to the first
+## overload that matches.
+var objTypeNames: seq[string] = @[]
+var objTypeBases: seq[string] = @[]
+var methDispKey: seq[string] = @[]     # method base name (opName of the symbol)
+var methDispName: seq[string] = @[]    # that group's dispatcher function
+var methImplSym: seq[string] = @[]     # one overload's full nimony symbol
+var methImplName: seq[string] = @[]    # its emitted function name
+var methImplDisp: seq[string] = @[]    # the dispatcher it belongs to
+var methImplType: seq[string] = @[]    # its receiver's mangled type name
+
+## the dispatch key of a type node. nimony gives a `ref object` TWO symbols — the
+## alias `Circle.0.` and the object `Circle.Obj.0.` — and the constructor, the
+## method receiver and the inheritance link do not all use the same one, so the
+## unique mangled name cannot join them up. The readable base does, and it is also
+## what `__t` should read as.
+proc typeKeyOf(c: Cursor): string =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == RefTagId or n.tagEnum == MutTagId or
+        n.tagEnum == OutTagId or n.tagEnum == SinkTagId or n.tagEnum == LentTagId or
+        n.tagEnum == PtrTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return prettyBase(pool.syms[n.symId])
+  return ""
+
+proc objBaseOf(t: string): string =
+  for i in 0 ..< objTypeNames.len:
+    if objTypeNames[i] == t: return objTypeBases[i]
+  return ""
+
+## does `t`, or anything it inherits from, have a method? Only those types need a
+## `__t` tag — tagging everything would put the field on every Table/HashSet node.
+proc dispatchesOn(t: string): bool =
+  var cur = t
+  var guard = 0
+  while cur.len > 0 and guard < 64:
+    for x in methImplType:
+      if x == cur: return true
+    cur = objBaseOf(cur)
+    inc guard
+  return false
+
+proc methImplFor(sym: string): string =
+  for i in 0 ..< methImplSym.len:
+    if methImplSym[i] == sym: return methImplName[i]
+  return ""
 
 ## the mangled Obj-class name behind a `(ref X (notnil))` | `X` type node (the
 ## form `newobj`/`instanceof` reference); "" if it is not a plain symbol/ref.
@@ -1180,11 +1244,17 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       # An exception type is a real JS class: `new Cls({fields})`. A plain
       # ref/value object stays an object literal `({fields})`.
       let cls = excRefClassName(n)
+      let tkey = typeKeyOf(n)
       let isExc = cls.len > 0 and isExcClass(cls)
       skip n                                     # TYPE
       if isExc: e.emit("new " & cls & "(")
       e.emit("({")
       var first = true
+      # a type that participates in method dispatch carries its own name, because
+      # a plain object literal has nothing else to dispatch on.
+      if not isExc and tkey.len > 0 and dispatchesOn(tkey):
+        e.emit("__t: " & jsString(tkey))
+        first = false
       while n.kind != ParRi:
         if n.kind == ParLe and n.tagEnum == KvTagId:
           if not first: e.emit(", ")
@@ -1275,7 +1345,7 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       skip n
   consumeParRi n
 
-proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false) =
+proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false) =
   ## (proc :name … (params …) RETTYPE … (stmts BODY)). Shape via hlwalk.decodeProc;
   ## params come before the body in the grammar, so collect (filling curBoxed)
   ## then emit — a forward decl (no stmts) emits nothing, as before.
@@ -1290,7 +1360,11 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false) =
   # emitStmt skips already; this catches the plain-proc hooks. User procs never begin
   # with `=`, so nothing user-defined is dropped.
   if rawName.len > 0 and rawName[0] == '=': return
-  let name = mangle(rawName)
+  # a method's symbol is mapped to its DISPATCHER, so the overload itself has to
+  # use the implementation name scanMethods reserved for it.
+  var name = ""
+  if isMethod: name = methImplFor(rawName)
+  if name.len == 0: name = mangle(rawName)
   if isIter: iterNames.add name
   var params: seq[string] = @[]
   let savedBoxed = curBoxed
@@ -1680,6 +1754,7 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
   elif t == ProcTagId or t == FuncTagId: emitProc(e, n)
   elif t == IteratorTagId: emitProc(e, n, isIter = true)
+  elif t == MethodTagId: emitProc(e, n, isMethod = true)
   elif t == YldTagId:
     inc n                                       # (yld VALUE) -> yield VALUE;
     e.emit("yield "); emitExpr(e, n, curRetBig); e.emit(";")
@@ -1699,11 +1774,15 @@ proc scanExcTypes(n: var Cursor) =
     inc c                                # NAME
     let nm = if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
                mangle(pool.syms[c.symId]) else: ""
+    let key = if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+                prettyBase(pool.syms[c.symId]) else: ""
     inc c                                # past NAME -> export/typevars/pragmas…
     while c.kind != ParRi and not (c.kind == ParLe and c.tagEnum == ObjectTagId):
       skip c                             # skip export, typevars, pragmas to the body
     if nm.len > 0 and c.kind == ParLe and c.tagEnum == ObjectTagId:
-      inc c                              # -> BASE (sym) | `.`
+      inc c                              # -> BASE: a symbol, `(ref X.Obj …)`, or `.`
+      objTypeNames.add key
+      objTypeBases.add typeKeyOf(c)
       if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
         let baseNm = pool.syms[c.symId]
         if opName(baseNm) == "Exception":
@@ -1715,6 +1794,86 @@ proc scanExcTypes(n: var Cursor) =
     inc n
     while n.kind != ParRi: scanExcTypes(n)
     consumeParRi n
+
+proc scanMethods(n: var Cursor) =
+  ## walk the tree; for every `(method :sym … (params (param :self … TYPE …) …) …)`
+  ## allocate the group's dispatcher (one per method BASE name), the overload's own
+  ## implementation name, and its receiver type. Must run before anything mangles a
+  ## method symbol: it seeds the rename table so a call site that sem resolved to
+  ## *any* overload emits the dispatcher's name instead.
+  if n.kind != ParLe:
+    inc n
+    return
+  if n.tagEnum == MethodTagId:
+    var c = n
+    let sh = decodeProc(c)
+    let raw = pool.syms[sh.name]
+    if raw.len > 0 and raw[0] != '=':          # skip the ARC hooks (=destroy & co)
+      let key = opName(raw)
+      var di = -1
+      for i in 0 ..< methDispKey.len:
+        if methDispKey[i] == key: di = i
+      if di < 0:
+        methDispKey.add key
+        methDispName.add uniqueJs(key)
+        di = methDispKey.len - 1
+      let disp = methDispName[di]
+      renameKeys.add raw
+      renameVals.add disp
+      var recv = ""
+      if sh.hasParams:
+        var pc = sh.params
+        inc pc                                 # into (params …)
+        if pc.kind == ParLe and pc.tagEnum == ParamTagId:
+          inc pc                               # `param` tag
+          inc pc                               # name
+          skip pc                              # export
+          skip pc                              # pragmas
+          recv = typeKeyOf(pc)
+      methImplSym.add raw
+      methImplName.add uniqueJs(key & "__" & recv)
+      methImplDisp.add disp
+      methImplType.add recv
+    skip n
+  else:
+    inc n
+    while n.kind != ParRi: scanMethods(n)
+    consumeParRi n
+
+proc emitDispatchers(): string =
+  ## `_base` (declared in the prelude, shared across modules) plus one dispatcher
+  ## per method name. Tables accumulate across modules and function declarations
+  ## hoist, so re-emitting per module is harmless — the last, most complete
+  ## definition is the one that binds.
+  if methDispName.len == 0: return ""
+  var e = JsEmitter(js: "")
+  var pairs = ""
+  var first = true
+  for i in 0 ..< objTypeNames.len:
+    if objTypeBases[i].len > 0 and dispatchesOn(objTypeNames[i]):
+      if not first: pairs.add ", "
+      first = false
+      pairs.add jsString(objTypeNames[i]) & ": " & jsString(objTypeBases[i])
+  if pairs.len > 0: e.emit("Object.assign(_base, {" & pairs & "});\n")
+  for d in 0 ..< methDispName.len:
+    let disp = methDispName[d]
+    e.emit("function " & disp & "(_s){\n")
+    e.emit("  let _t = (_s === null || _s === undefined) ? \"\" : (_s.__t || \"\");\n")
+    e.emit("  while(_t !== \"\"){\n")
+    for i in 0 ..< methImplSym.len:
+      if methImplDisp[i] == disp:
+        e.emit("    if(_t === " & jsString(methImplType[i]) & ") return " &
+               methImplName[i] & ".apply(null, arguments);\n")
+    e.emit("    _t = _base[_t] || \"\";\n")
+    e.emit("  }\n")
+    # no tag, or nothing overrides anywhere up the chain: the `{.base.}` method,
+    # which is the first overload declared for this name.
+    var fb = ""
+    for i in 0 ..< methImplSym.len:
+      if methImplDisp[i] == disp and fb.len == 0: fb = methImplName[i]
+    if fb.len > 0: e.emit("  return " & fb & ".apply(null, arguments);\n")
+    e.emit("}\n")
+  result = e.js
 
 proc scanEnums(n: var Cursor) =
   ## walk the tree; for (enum … (efld :val … (tup ORD "name"))) record val->ORD.
@@ -1784,7 +1943,7 @@ proc jsPrelude*(): string =
   ## the once-per-program runtime shim (echo capture, float print, seq/str append,
   ## and — in faithful mode — the 64-bit bigint wrappers).
   var e = JsEmitter(js: "")
-  e.emit("'use strict';\nlet __out='';\n")
+  e.emit("'use strict';\nlet __out='';\nconst _base = {};\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
   # `String(x)` is NOT nimony's `$float`. Both print shortest-round-trip digits,
   # but they disagree about when to use exponent form: JS switches at 1e21 and
@@ -1838,6 +1997,8 @@ proc emitModuleBody*(root: var Cursor): string =
   ## emit ONE module's JS (no prelude/flush): procs float up (JS hoists function
   ## decls), top-level statements run at module scope. Enum-ordinal and var/out
   ## param scans accumulate into the shared tables so cross-module calls resolve.
+  var scanCur0 = root
+  scanMethods(scanCur0)               # first: it seeds the rename table
   var scanCur = root
   scanEnums(scanCur)
   var scanCur2 = root
@@ -1846,7 +2007,7 @@ proc emitModuleBody*(root: var Cursor): string =
   scanExcTypes(scanCur3)
   var e = JsEmitter(js: "")
   emitStmt(e, root)
-  result = e.js
+  result = emitDispatchers() & e.js
 
 proc emitModule*(root: var Cursor): string =
   ## single-module convenience: full standalone JS (prelude + body + flush).
