@@ -296,6 +296,49 @@ proc isSetType(c: Cursor): bool =
     return nm == "HashSet" or nm == "OrderedSet"
   return false
 
+## the JS value a `var x: T` with no initializer starts at. This used to be a
+## blanket `0`, which is only right for the numeric types: `var grid: array[2,
+## array[3, int]]` became the *number* 0, so `grid[1][2] = 5` wrote a property
+## onto a primitive and evaporated, and `var s: string` echoed "0".
+proc defaultVal(c: Cursor): string =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId):
+    inc n
+  if isSetType(n): return "new Set()"
+  case typeNamed(n)
+  of 1: return "\"\\u0000\""                 # char — nimony's default is '\0'
+  of 2: return "\"\""
+  else: discard
+  case n.kind
+  of Symbol, SymbolDef, Ident:
+    let nm = opName(pool.syms[n.symId])
+    if nm == "seq": return "[]"
+    elif nm == "bool": return "false"
+    return "0"
+  of ParLe:
+    let t = n.tagEnum
+    if t == BoolTagId: return "false"
+    elif t == ArrayTagId:
+      inc n                                  # (array ELEM (rangetype BASE lo hi))
+      let elem = defaultVal(n)
+      skip n
+      var count = 0
+      if n.kind == ParLe and n.tagEnum == RangetypeTagId:
+        inc n; skip n                        # past the rangetype's base type
+        var lo = 0
+        var hi = -1
+        if n.kind == IntLit: lo = int(pool.integers[n.intId])
+        skip n
+        if n.kind == IntLit: hi = int(pool.integers[n.intId])
+        count = hi - lo + 1
+        if count < 0: count = 0
+      # Array.from, not .fill: a nested array default must be a fresh value per
+      # slot. `.fill([])` would alias one array into every row.
+      return "Array.from({length: " & $count & "}, () => " & elem & ")"
+    else: return "0"
+  else: return "0"
+
 ## true iff the expression (unwrapping a leading haddr/hderef) is a known set var
 ## — the set operand of an `incl`/`excl`/`contains`/`len` magic call.
 proc operandIsSet(c: Cursor): bool =
@@ -339,7 +382,14 @@ proc sourceIsChar(n: Cursor): bool =
     else: return false
   else: return false
 
+const hexDigits = "0123456789abcdef"
+
 proc jsString(s: string): string =
+  ## A nimony string/char literal as a JS string literal. Control bytes are
+  ## escaped rather than passed through: `'\0'` used to emit a *raw* NUL into the
+  ## JS source, which is legal JS but does not survive anything that touches the
+  ## text between here and the engine (a pipe, a shell capture, an HTML <script>),
+  ## and silently became the empty string when it didn't.
   result = "\""
   for ch in s:
     case ch
@@ -348,7 +398,14 @@ proc jsString(s: string): string =
     of '\n': result.add "\\n"
     of '\t': result.add "\\t"
     of '\r': result.add "\\r"
-    else: result.add ch
+    else:
+      let b = int(ch)
+      if b < 0x20 or b == 0x7f:
+        result.add "\\u00"
+        result.add hexDigits[(b shr 4) and 0xf]
+        result.add hexDigits[b and 0xf]
+      else:
+        result.add ch
   result.add "\""
 
 # forward decls (same shape as interp.nim)
@@ -842,6 +899,11 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
     let nm = mangle(pool.syms[n.symId])
     let eo = enumLookup(nm)
     if eo.len > 0: e.emit(eo)                  # enum value -> its ordinal
+    # A var/out param is a `{get v, set v}` box, and nimony does not always wrap a
+    # use of one in `(hderef …)` — a `var seq[T]`/`var T` param reaches a magic like
+    # `add` as a bare symbol. Emitting the box there yielded `s = __append(s, …)`,
+    # i.e. `c.push is not a function`. The cell is the value; the box never is.
+    elif boxContains(nm): e.emit(nm & ".v")
     else: e.emit(nm)
     inc n
   of ParLe:
@@ -1299,10 +1361,10 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   if sh.hasInit:
     var ic = sh.init
     e.emit(" = "); emitExpr(e, ic, big)
-  elif isSet:
-    e.emit(" = new Set()")                 # uninitialised HashSet -> empty JS Set
+  elif big:
+    e.emit(" = 0n")
   else:
-    e.emit(if big: " = 0n" else: " = 0")   # uninitialised — JS-safe default
+    e.emit(" = " & defaultVal(sh.typ))     # uninitialised — T's own default
   e.emit(";")
 
 proc emitAsgn(e: var JsEmitter; n: var Cursor) =
