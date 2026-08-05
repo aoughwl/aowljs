@@ -180,7 +180,7 @@ proc isReservedJs(s: string): bool =
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
 var renameKeys: seq[string] = @[]
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","_base","_t","_s","_f",
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","_base","_ret","_t","_s","_f",
   "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
 proc prettyTaken(p: string): bool =
   for a in renameTaken:
@@ -418,6 +418,31 @@ proc typeNamed(c: Cursor): int =
     elif t == StringTagId or t == CstringTagId: return 2
     else: return 0
   else: return 0
+
+## Bindings whose declared type is a `seq`. Needed because a generic instance
+## reads a seq's length as a FIELD (`xs.len`) rather than through the `len`
+## magic, and a seq is a JS Array here — see the DotTagId branch.
+var seqVars: seq[string] = @[]
+proc seqAdd(nm: string) =
+  if not listHas(seqVars, nm): seqVars.add nm
+
+proc isSeqType(c: Cursor): bool =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return opName(pool.syms[n.symId]) == "seq"
+  return false
+
+## is this expression (unwrapping a leading haddr/hderef) a known seq binding?
+proc isSeqVar(c: Cursor): bool =
+  var n = c
+  if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return listHas(seqVars, mangle(pool.syms[n.symId]))
+  return false
 
 ## true iff a type node denotes a std/sets `HashSet`/`OrderedSet` (unwrapping
 ## mut/out/sink/lent/rangetype). Such a value maps to a native JS `Set`.
@@ -896,6 +921,20 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     else:
       e.emit("[]")
     while n.kind != ParRi: skip n
+  elif name == "toOpenArray" and magic:
+    # Passing an array/seq to an `openArray` param lowers to
+    # `f(toOpenArray(xs))`. collExpr unwrapped that in FOR-LOOP position only, so
+    # in argument position it emitted a call to a `toOpenArray` that does not
+    # exist. In JS the array IS the view: the one-argument form is the collection
+    # itself, and the three-argument form is an INCLUSIVE lo..hi slice.
+    skip n                                   # callee
+    emitExpr(e, n)                           # the collection
+    if n.kind != ParRi:
+      let lo = exprToStr(n)
+      if n.kind != ParRi:
+        let hi = exprToStr(n)
+        e.emit(".slice(Number(" & lo & "), Number(" & hi & ") + 1)")
+    while n.kind != ParRi: skip n
   elif name == "newString" and magic:
     skip n; e.emit("\"\"")                    # newString(n) -> empty string
     while n.kind != ParRi: skip n
@@ -989,7 +1028,14 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     while n.kind != ParRi: skip n
   else:
     let boxed = boxLookup(name)                # ",i,j," of boxed param positions
-    e.emit(mangle(callee)); inc n
+    if callee.len > 0:
+      e.emit(mangle(callee)); inc n
+    else:
+      # An INDIRECT call: the callee is an expression, not a symbol — a proc value
+      # out of an array or field, `(call (arrat fns 0 1) 5)`. `callee` is "" for
+      # those, and mangle("") is `_`, so this emitted a call to a function named
+      # `_` that nothing defines.
+      e.emit("("); emitExpr(e, n); e.emit(")")
     e.emit("(")
     var first = true
     var idx = 0
@@ -1411,8 +1457,18 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
     elif t == DotTagId or t == DdotTagId:
       # (dot OBJ FIELD idx "name"); ddot is the ref-object deref-dot — the deref is
       # implicit in JS (objects are references), so both are just `OBJ.field`.
-      inc n; emitExpr(e, n)
-      e.emit("." & mangle(pool.syms[n.symId])); inc n
+      inc n
+      # A nimony `seq` is the record `{len, data}`, and a GENERIC INSTANCE reads
+      # `xs.len` as a FIELD rather than through the `len` magic — spelled exactly
+      # like a user field, `(dot xs len.0 0 "x")`. A seq is a JS Array here, which
+      # has no `len`, so `xs.len` was `undefined` and `if xs.len > 0` was quietly
+      # false: `firstOf(@[7, 8], 0)` returned the fallback. Only rewrite when the
+      # OBJECT is a known seq, so a user field named `len` is untouched.
+      let objIsSeq = isSeqVar(n)
+      emitExpr(e, n)
+      let fld = mangle(pool.syms[n.symId]); inc n
+      if objIsSeq and fld == "len": e.emit(".length")
+      else: e.emit("." & fld)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == BaseobjTagId:
@@ -1475,6 +1531,7 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       of 2: strAdd pnm
       else: discard
       if isSetType(typeCur): setAdd pnm        # HashSet param -> native JS Set
+      if isSeqType(typeCur): seqAdd pnm        # `xs.len` in a generic instance
       if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
       # NOTE: a by-value param needs NO copy on entry. nimony rejects mutating one
       # ("cannot mutate expression p.x"), so the callee cannot write through it,
@@ -1490,6 +1547,54 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
     else:
       skip n
   consumeParRi n
+
+## The mangled name of a routine's `result` local, wherever it is declared, or ""
+## when it has none. `defer` lowers to `(try (stmts (result …) …) (fin …))` — the
+## declaration ends up INSIDE the try — and JS `let` is block-scoped, so the
+## `finally` clause (and the `return`) could not see it:
+## `ReferenceError: result_3 is not defined`. Found by searching the body rather
+## than assuming a position, and NOT descending into a nested routine, whose
+## `result` is its own.
+var curResultLocal = ""
+
+## Set to a JS label when the routine has BOTH a hoisted `result` and a `finally`
+## (i.e. a `defer`). Every `return` then assigns and breaks out to it, so the
+## value is read after finally rather than before. "" otherwise, which is the
+## ordinary `return expr;` path.
+var curRetLabel = ""
+
+## does this body contain a `finally`? (Not descending into a nested routine —
+## its `finally` is its own problem.)
+proc hasFinally(c: Cursor; depth = 0): bool =
+  var n = c
+  if n.kind != ParLe or depth > 6: return false
+  inc n
+  while n.kind != ParRi:
+    if n.kind == ParLe:
+      let t = n.tagEnum
+      if t == FinTagId: return true
+      if t != ProcTagId and t != FuncTagId and t != IteratorTagId and t != MethodTagId:
+        if hasFinally(n, depth + 1): return true
+    skip n
+  return false
+
+proc resultLocalOf(body: Cursor; depth = 0): string =
+  var n = body
+  if n.kind != ParLe or depth > 4: return ""
+  inc n
+  while n.kind != ParRi:
+    if n.kind == ParLe:
+      let t = n.tagEnum
+      if t == ResultTagId:
+        var c = n; inc c
+        if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
+          return mangle(pool.syms[c.symId])
+      elif t == StmtsTagId or t == ScopeTagId or t == TryTagId or t == IfTagId or
+           t == ElifTagId or t == ElseTagId or t == BlockTagId:
+        let inner = resultLocalOf(n, depth + 1)
+        if inner.len > 0: return inner
+    skip n
+  return ""
 
 ## true iff this is a compiler-generated ARC/RTTI hook (`=destroy`, `=wasmoved`,
 ## `=dup`, `=copy`, `=sink`/`=sinkh`, `=trace`) rather than a user routine that
@@ -1566,10 +1671,19 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
     # can't mix with bigint arithmetic inside the body. BigInt() is a no-op on an
     # existing bigint, so typed callers are unaffected.
     for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
-    # take ownership of by-value aggregates at entry, once, rather than at every
-    # call site — a caller cannot know whether the callee writes to them.
+    let savedResult = curResultLocal
+    let savedLabel = curRetLabel
+    curResultLocal = resultLocalOf(sh.body)     # hoist `result` — see resultLocalOf
+    if curResultLocal.len > 0: e.emit("  let " & curResultLocal & ";\n")
+    curRetLabel = ""
+    if curResultLocal.len > 0 and hasFinally(sh.body):
+      curRetLabel = "_ret"
+      e.emit("  _ret: {\n")
     var bc = sh.body
     emitStmts(e, bc)
+    if curRetLabel.len > 0: e.emit("\n  }\n  return " & curResultLocal & ";")
+    curResultLocal = savedResult
+    curRetLabel = savedLabel
     e.emit("\n}\n")
   curRetBig = savedRetBig
   curBoxed = savedBoxed
@@ -1617,6 +1731,7 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   if big: bigAdd nm
   let isSet = isSetType(sh.typ)               # HashSet -> native JS Set
   if isSet: setAdd nm
+  if isSeqType(sh.typ): seqAdd nm             # `xs.len` in a generic instance
   let tn = typeNamed(sh.typ)                  # distinguish char (charCodeAt) from string
   if tn == 1: charAdd nm
   elif tn == 2:
@@ -1636,7 +1751,11 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
     if fis.len > 0:
       tupleVars.add nm
       tupleFloatIdx.add fis
-  e.emit("let " & nm)
+  # A hoisted `result` is already declared at function scope; re-declaring it
+  # here would put a second, block-scoped binding inside the try that `finally`
+  # still could not see.
+  if nm == curResultLocal: e.emit(nm)
+  else: e.emit("let " & nm)
   if sh.hasInit:
     var ic = sh.init
     # A local declared `int`/`int64` is registered as a bigint on the strength of
@@ -1708,7 +1827,16 @@ proc emitWhile(e: var JsEmitter; n: var Cursor) =
 
 proc emitRet(e: var JsEmitter; n: var Cursor) =
   inc n
-  if n.kind == ParRi: e.emit("return;")
+  if curRetLabel.len > 0:
+    # This routine has BOTH a result and a `finally` (a `defer`). JS evaluates a
+    # `return` expression BEFORE running finally, so `return result` handed back
+    # the value the defer was about to change — `deferred(4)` answered 10 where
+    # nimony says 100, silently. Assign and jump out of a labelled block instead;
+    # the single `return` after it reads the variable once finally has run.
+    if n.kind != ParRi:
+      e.emit(curResultLocal & " = "); emitExpr(e, n, curRetBig); e.emit("; ")
+    e.emit("break " & curRetLabel & ";")
+  elif n.kind == ParRi: e.emit("return;")
   else:
     e.emit("return "); emitExpr(e, n, curRetBig); e.emit(";")
   consumeParRi n
@@ -2096,7 +2224,13 @@ proc scanEnums(n: var Cursor) =
   if n.kind != ParLe:
     inc n
     return
-  if n.tagEnum == EnumTagId:
+  # `onum` is the enum-WITH-HOLES type — what nimony emits the moment any value
+  # is given an explicit ordinal (`cRed = 1, cGreen = 4`). Scanning only `enum`
+  # meant those values were never mapped to their ordinals, so every use emitted
+  # a bare `cRed` that nothing defines: `ReferenceError: cRed is not defined`.
+  # The body is identical apart from a leading base-type child, which the loop
+  # below skips like any other non-efld node.
+  if n.tagEnum == EnumTagId or n.tagEnum == OnumTagId:
     inc n
     while n.kind != ParRi:
       if n.kind == ParLe and n.tagEnum == EfldTagId:
