@@ -118,6 +118,17 @@ Two properties are covered because they are wrong *silently* when they are wrong
   iteration agree with nimony exactly, and the output is decoded back to text at
   the end (`string_bytes.nim`, `string_print.nim`).
 
+**The value representation is gated against aowlabi.**
+[`aowlabi`](https://github.com/aoughwl/aowlabi) states the canonical JS
+representation for every type in its marshal matrix, and this backend is the
+consumer that turns that claim into real JavaScript values. Its
+`tests/jsrepr.sh` declares one global per type, transpiles it here in **both**
+modes, runs the emitted module and classifies the value structurally — `typeof`,
+`Array.isArray`, `instanceof Set` — never by matching this emitter's own output
+text, which would agree by construction. **17/17.** `int64` is the row where the
+two modes have to differ (a JS number in fast mode, a BigInt in faithful), which
+is the property this backend's `--faithful` flag exists for.
+
 **Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
 against a hand-written JavaScript version of the same program — the emitted code
 *is* JavaScript, so 1.00x is the target, not a stretch. Currently: a tight
