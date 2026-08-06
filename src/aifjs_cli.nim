@@ -60,4 +60,19 @@ proc main =
 
   write stdout, outp
 
+  # Report calls with no definition, AFTER every module has had its chance to
+  # define what an earlier one called. Without this a gap in the backend — an
+  # unshimmed std proc, say — showed up only when the program ran, as
+  # `ReferenceError: paramCount is not defined`, naming neither aowljs nor the
+  # nimony symbol. stderr, so it never contaminates the emitted JS on stdout, and
+  # the exit status stays 0: the output is still valid for everything else.
+  let missing = undefinedCalls()
+  if missing.len > 0:
+    write stderr, "aifjs: " & $missing.len & " call(s) with no definition — unsupported here:\n"
+    for m in missing:
+      write stderr, "  " & m & "\n"
+    let mem = undefinedMemoryCalls()
+    if mem > 0:
+      write stderr, "  (plus " & $mem & " memory-management call(s) a GC'd target does not implement)\n"
+
 main()

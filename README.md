@@ -132,6 +132,25 @@ and 1.4 MB took **11.07s**. It is a hash lookup now — the same 1.4 MB takes
 **0.19s** — and `tests/bench/bigmodule.nim` (1600 procs, 400 types) is there so
 the number stays visible.
 
+**Gaps are reported at emit time, on stderr.** A call to something this backend
+never defines used to surface only when the program ran, as `ReferenceError:
+paramCount is not defined` — naming neither aowljs nor the nimony symbol. The CLI
+now lists them after every module has had its chance to define what an earlier one
+called, and exits 0, because the rest of the output is still valid:
+
+```
+aifjs: 1 call(s) with no definition — unsupported here:
+  paramCount
+```
+
+Three categories are counted rather than listed, because they are deliberate and
+would otherwise drown the signal: nimony's manual memory layer (`alloc`,
+`arcInc`, …), the ARC hooks (`=destroy` & co), and std/sets' table internals,
+which are replaced wholesale by a native JS `Set`. Across the corpus exactly one
+program reports, and truthfully: `iterators` reaches std/syncio's C FFI layer
+(`fopen`, `c_fwrite`, `fgets`), which is real file I/O this backend does not
+implement.
+
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it
 (`lambdalifting.nim` asserts `env.s != SymId(0)`), so there is no reference output

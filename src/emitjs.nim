@@ -216,6 +216,78 @@ proc isReservedJs(s: string): bool =
     if r == s: return true
   return false
 
+## Names emitted as a function DEFINITION, and names emitted as a plain CALL.
+## A call to something never defined is a gap in this backend — an unshimmed
+## `std/os` proc, say — and it used to surface only at run time, as
+## `ReferenceError: paramCount is not defined`, which names neither aowljs nor the
+## nimony symbol. Reported at the end of emission instead, on stderr, once every
+## module has had its chance to define what an earlier one called.
+var definedFns = smNew(1024)
+var calledFns = smNew(1024)
+var calledOrder: seq[string] = @[]
+proc noteDefined*(nm: string) = smPut(definedFns, nm, 1)
+proc noteCalled(nm: string) =
+  if smGet(calledFns, nm) < 0:
+    smPut(calledFns, nm, 1)
+    calledOrder.add nm
+
+## nimony's manual memory layer. A garbage-collected target has none of it and
+## needs none of it, so aowljs deliberately does not emit these — but calls to
+## them survive inside the system seq/string bodies it does emit. Counting them
+## apart keeps the report about REAL gaps instead of drowning it: `combined.nim`
+## listed 18 names, every one of them from here.
+proc isMemoryRuntimeName(nm: string): bool =
+  return nm == "alloc" or nm == "dealloc" or nm == "deallocFixed" or
+         nm == "realloc" or nm == "allocatedSize" or nm == "recalcCap" or
+         nm == "arcInc" or nm == "arcDec" or nm == "getRtti" or
+         nm == "allocFixed" or nm == "deallocShared" or nm == "allocShared"
+
+## std/sets' HashSet internals. aowljs maps a HashSet onto a native JS `Set`
+## wholesale, so the table implementation behind it is deliberately not emitted —
+## the same situation as the memory layer, and it accounted for every remaining
+## line of the report on the two HashSet fixtures.
+proc isReplacedRuntimeName(nm: string): bool =
+  var b = nm
+  var i = b.len
+  while i > 1 and b[i-1] in {'0'..'9'}: dec i
+  if i > 1 and i < b.len and b[i-1] == '_': b = b[0 ..< i-1]
+  return b == "hash" or b == "isFilled" or b == "nextTry" or b == "mustRehash" or
+         b == "resize" or b == "rawGet" or b == "rawInsert" or b == "enlarge"
+
+## Names emitted as a VARIABLE binding. A proc value lives in one — `var c =
+## counter(10)` then `c()` — and a call through it names something that is
+## defined, just not as a function.
+var definedVars = smNew(512)
+proc noteVariable(nm: string) = smPut(definedVars, nm, 1)
+
+proc isDroppedHookName(nm: string): bool =
+  ## the ARC hooks, after mangling: `=destroy` prettifies to `_destroy`, and a
+  ## second one of the same base becomes `_destroy_2`.
+  var b = nm
+  var i = b.len
+  while i > 2 and b[i-1] in {'0'..'9'}: dec i
+  if i > 1 and i < b.len and b[i-1] == '_': b = b[0 ..< i-1]
+  return b == "_destroy" or b == "_dup" or b == "_copy" or b == "_wasMoved" or
+         b == "_sink" or b == "_sinkh" or b == "_trace"
+
+## Calls with no definition, split: real gaps first, and a COUNT of the
+## memory-management names a GC'd target does not implement.
+proc undefinedCalls*(): seq[string] =
+  result = @[]
+  for nm in calledOrder:
+    if smGet(definedFns, nm) >= 0: continue
+    if smGet(definedVars, nm) >= 0: continue
+    if isMemoryRuntimeName(nm) or isDroppedHookName(nm) or isReplacedRuntimeName(nm): continue
+    result.add nm
+
+proc undefinedMemoryCalls*(): int =
+  result = 0
+  for nm in calledOrder:
+    if smGet(definedFns, nm) >= 0: continue
+    if smGet(definedVars, nm) >= 0: continue
+    if isMemoryRuntimeName(nm) or isDroppedHookName(nm) or isReplacedRuntimeName(nm):
+      result = result + 1
+
 ## GLOBAL rename table: original full nimony symbol (`fib.1.main`) -> a readable,
 ## valid JS identifier (`fib`). The key->index map is the lookup; `renameVals`
 ## keeps the names in insertion order.
@@ -1295,7 +1367,13 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   else:
     let boxed = boxLookup(name)                # ",i,j," of boxed param positions
     if callee.len > 0:
-      e.emit(mangle(callee)); inc n
+      let cnm = mangle(callee)
+      # Only a real ROUTINE symbol is a candidate for "called but never defined".
+      # A module-local symbol (one dot) here is a proc VALUE held in a variable —
+      # `c()` where `c: proc(): int` — which is defined as a binding, not a
+      # function, and reporting it was pure noise.
+      if not isModuleLocalSym(callee): noteCalled cnm
+      e.emit(cnm); inc n
     else:
       # An INDIRECT call: the callee is an expression, not a symbol — a proc value
       # out of an array or field, `(call (arrat fns 0 1) 5)`. `callee` is "" for
@@ -2002,6 +2080,7 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false; isMethod = false)
       if isFloatType(rc) and not listHas(floatProcs, name): floatProcs.add name
   if sh.hasBody:
     let kw = if isIter: "function* " else: "function "
+    noteDefined name                            # see undefinedCalls
     e.emit(kw & name & "(" & joinList(params, ", ") & "){\n")
     # coerce plain bigint params so an untyped-literal argument (a bare `number`)
     # can't mix with bigint arithmetic inside the body. BigInt() is a no-op on an
@@ -2088,6 +2167,7 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
     if fis.len > 0:
       tupleVars.add nm
       tupleFloatIdx.add fis
+  noteVariable nm                             # a proc VALUE can live here
   # A hoisted `result` is already declared at function scope; re-declaring it
   # here would put a second, block-scoped binding inside the try that `finally`
   # still could not see.
@@ -2607,6 +2687,7 @@ proc emitDispatchers(): string =
   if pairs.len > 0: e.emit("Object.assign(_base, {" & pairs & "});\n")
   for d in 0 ..< methDispName.len:
     let disp = methDispName[d]
+    noteDefined disp
     e.emit("function " & disp & "(_s){\n")
     e.emit("  let _t = (_s === null || _s === undefined) ? \"\" : (_s.__t || \"\");\n")
     e.emit("  while(_t !== \"\"){\n")
