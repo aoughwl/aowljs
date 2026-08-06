@@ -202,8 +202,51 @@ proc prettyBase(name: string): string =
   if isReservedJs(res): res = "_" & res
   return res
 
+## Which module is being emitted. A nimony LOCAL's symbol is just `name.N`, with
+## no module segment, and the disambiguating counter RESTARTS per module — so
+## `result.0` in one module and `result.0` in another are the same string and the
+## rename table merged them into one entry. That is not merely a naming nicety:
+## the bigint/string/float/seq tracking lists are keyed on the mangled name, so a
+## proc returning `int` in one module made a proc returning `string` in another be
+## treated as a bigint, and `result = "mid=" & …` became `BigInt("mid=10")`.
+var moduleSeq = 0
+var curModuleKey = "m0"
+
+## true iff this symbol may be module-local — exactly one dot (`result.0`, `x.2`).
+## A global, proc or type carries a trailing segment (`baseCounter.0.`,
+## `bump.0.`, `P.0.`, `add.0.I8fahwb`) and MUST keep one name across modules or a
+## cross-module reference would not resolve.
+##
+## ⚠️ A FIELD is spelled exactly like a local (`qty.0`, `len.0`) and is NOT
+## local — a type declared in one module is constructed and read in another. Field
+## symbols therefore go through `mangleShared`, not here; keying them per module
+## renamed the reader's field away from the writer's and every cross-module field
+## access read `undefined`.
+proc isModuleLocalSym(name: string): bool =
+  var dots = 0
+  for ch in name:
+    if ch == '.': inc dots
+  return dots == 1
+
 ## a nimony symbol -> a stable, readable, valid JS identifier (see renameTaken).
 proc mangle(name: string): string =
+  let key = if isModuleLocalSym(name): curModuleKey & "|" & name else: name
+  for i in 0 ..< renameKeys.len:
+    if renameKeys[i] == key: return renameVals[i]
+  let base = prettyBase(name)
+  var cand = base
+  var k = 2
+  while prettyTaken(cand):
+    cand = base & "_" & $k
+    inc k
+  renameKeys.add key
+  renameVals.add cand
+  renameTaken.add cand
+  return cand
+
+## A field name, which is shared across modules however it is spelled. Same table,
+## but never keyed per module — see isModuleLocalSym.
+proc mangleShared(name: string): string =
   for i in 0 ..< renameKeys.len:
     if renameKeys[i] == name: return renameVals[i]
   let base = prettyBase(name)
@@ -1583,7 +1626,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
           if not first: e.emit(", ")
           first = false
           inc n
-          e.emit(mangle(pool.syms[n.symId]) & ": "); inc n
+          e.emit(mangleShared(pool.syms[n.symId]) & ": "); inc n   # field name
           emitExpr(e, n)
           while n.kind != ParRi: skip n         # trailing inheritance-depth marker
           consumeParRi n
@@ -1607,7 +1650,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       # seq's `len` field becomes `len_3` the moment anything else claims `len` —
       # which is exactly what happened, and it re-broke this silently.
       let rawFld = pool.syms[n.symId]
-      let fld = mangle(rawFld); inc n
+      let fld = mangleShared(rawFld); inc n      # a field is shared across modules
       if objIsSeq and opName(rawFld) == "len": e.emit(".length")
       elif objIsSeq and opName(rawFld) == "data": discard  # the seq IS the array
       else: e.emit("." & fld)
@@ -2624,6 +2667,8 @@ proc emitModuleBody*(root: var Cursor): string =
   ## emit ONE module's JS (no prelude/flush): procs float up (JS hoists function
   ## decls), top-level statements run at module scope. Enum-ordinal and var/out
   ## param scans accumulate into the shared tables so cross-module calls resolve.
+  inc moduleSeq                       # see isModuleLocalSym: locals are keyed per module
+  curModuleKey = "m" & $moduleSeq
   var scanCur0 = root
   scanMethods(scanCur0)               # first: it seeds the rename table
   var scanCur = root
