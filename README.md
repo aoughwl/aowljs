@@ -193,12 +193,49 @@ aifjs: 1 call(s) with no definition — unsupported here:
   paramCount
 ```
 
-Across the whole corpus exactly one FEATURE is reported, and it is true:
-`sizeof` of a non-scalar type. The scalar widths are emitted directly; an
-aggregate needs a real layout model — which is what
-[`aowlabi`](https://github.com/aoughwl/aowlabi) is — so it throws by name rather
-than answering. It appears only inside the system allocation code this backend
-replaces, and no corpus program reaches it.
+**`sizeof` of an aggregate is answered by aowlabi, not by a table here.** It
+used to be the one FEATURE reported across the whole corpus, with the honest
+reason "an aggregate needs a real layout model". That model already existed —
+[`aowlabi`](https://github.com/aoughwl/aowlabi), gated against nimony's own
+`sizeof`, against gcc on the struct aowlc prints, and against gcc `-m32`. What
+was missing was the mapping from a NIF type node to a `TypeDesc`, and that
+mapping is all `src/abisize.nim` is: **nothing in it computes a size.**
+
+Extending the scalar-width table upward would have been the easy fix and the
+wrong one — it would have made this backend the *third* implementation of C
+struct layout in the stack, which is the shape that lets a padding defect live
+in two of them and get fixed in one. A mapper can be wrong; it cannot be
+independently wrong about padding.
+
+**The scalar table is gone too, and removing it fixed a wrong answer.** Keeping
+it "for the easy cases" is what a second implementation always looks like, and
+it had `cstring` grouped with `string` on the two-word arm: `sizeof(cstring)`
+emitted **16** where nimony says **8**. Not an aggregate, not a reported gap —
+an ordinary scalar expression, silently wrong, in the half of the code that
+looked too simple to be worth unifying. Every type now takes the one path.
+
+`abiSizeOf` returns **-1**, never a guess, so anything still unmapped keeps
+being reported rather than silently answered. `tests/corpus/sizeof_agg.nim` is
+the gate, and it has a real oracle: nimony folds `sizeof` in its own backend, so
+that program's stdout under nimony *is* the right answer. It covers the shapes a
+scalar table cannot reach — padding on both sides of a pointer-sized field, an
+inherited base, a `{.packed.}` object, a variant's largest branch, a tuple, an
+array of a padded element, the two-word `seq`/`string` headers — and the
+scalars, because a scalar row is what caught the duplicate. **26/26, both
+modes**, with the emitter reporting no gap of any kind for the program.
+
+Two rows exist because they are the only ones that can catch a specific mistake,
+and both did:
+
+- `sizeof(cstring)` is the scalar row described above — 16, where nimony says 8.
+- `sizeof(set[Wide])` is the only shape whose size comes from an enum's ordinal
+  RANGE rather than its width. The first mapper counted a fixed number of slots
+  to reach an `efld`'s `(tup ORD "name")` and landed on the type symbol instead,
+  so **every ordinal read as 0** — invisible everywhere else, because `enumDesc`
+  prefers the explicit width from the enum's base type whenever there is one. A
+  21-value enum makes it visible: nimony 3, the unfixed mapper 1.
+
+Falsified: ignoring the `packed` pragma turns that row from 10 into 24.
 
 Three categories are counted rather than listed, because they are deliberate and
 would otherwise drown the signal: nimony's manual memory layer (`alloc`,

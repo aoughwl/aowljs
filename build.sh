@@ -11,13 +11,24 @@
 set -euo pipefail
 NIM="${NIM:-/home/savant/nimony}"
 HL="${HL:-/home/savant/aowlhl}"
+# aowlabi is the stack's ONE layout engine; src/abisize.nim maps a NIF type onto
+# it so `sizeof` of an aggregate is answered rather than reported as a gap. A
+# declared, checked dependency — not a vendored copy, which would put a third
+# implementation of C struct layout in the stack.
+ABI="${ABI:-/home/savant/aowlabi}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NC="${NC:-$ROOT/nimcache}"
 
 mkdir -p "$NC" "$ROOT/bin"
+[ -d "$ABI/src" ] || {
+  echo "build.sh: no aowlabi checkout at $ABI — src/abisize.nim needs its layout" >&2
+  echo "  engine to answer sizeof of an aggregate. Clone aoughwl/aowlabi, or set ABI=." >&2
+  exit 1
+}
 # aowlhl imports nimony's own model/tag modules, which do not live in one directory.
 ${NIMLOCK:-} "$NIM/bin/nimony" c \
   -p:"$HL/src" \
+  -p:"$ABI/src" \
   -p:"$NIM/src/nimony" \
   -p:"$NIM/src/models" \
   --nimcache:"$NC" \

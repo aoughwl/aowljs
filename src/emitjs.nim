@@ -26,6 +26,7 @@ import std/[strutils, sets, tables]
 import nifcursors, nifstreams, nimony_model
 import tags
 import aowlhl/hlwalk   # shared HL-IR shape decoders (local/param/proc/if/case)
+import abisize         # `sizeof` of an aggregate, via aowlabi's layout engine
 
 type
   JsEmitter = object
@@ -531,35 +532,10 @@ proc isScalarVar(c: Cursor): bool =
     return (smGet(scalarSet, mangle(pool.syms[n.symId])) >= 0)
   return false
 
-## The byte size of a SCALAR type node, or 0 when it is not one. Enough for the
-## `sizeof` a program actually writes; an aggregate needs a real layout model
-## (aowlabi), so it is reported rather than guessed.
-proc scalarSizeOf(c: Cursor): int =
-  var n = c
-  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
-        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
-    inc n
-  case n.kind
-  of ParLe:
-    let t = n.tagEnum
-    if t == ITagId or t == UTagId or t == FTagId:
-      var d = n; inc d
-      if d.kind == IntLit: return int(pool.integers[d.intId]) div 8
-      return 8
-    elif t == CTagId or t == BoolTagId: return 1
-    elif t == PtrTagId or t == RefTagId or t == ProctypeTagId: return 8
-    elif t == StringTagId or t == CstringTagId: return 16
-    else: return 0
-  of Symbol, SymbolDef, Ident:
-    let nm = opName(pool.syms[n.symId])
-    if nm == "int" or nm == "int64" or nm == "uint" or nm == "uint64" or
-       nm == "float" or nm == "float64" or nm == "Natural" or nm == "Positive": return 8
-    elif nm == "int32" or nm == "uint32" or nm == "float32": return 4
-    elif nm == "int16" or nm == "uint16": return 2
-    elif nm == "int8" or nm == "uint8" or nm == "char" or nm == "bool": return 1
-    elif nm == "string" or nm == "cstring" or nm == "seq": return 16
-    else: return 0
-  else: return 0
+## (The scalar-width table that used to live here is gone: `abisize.abiSizeOf`
+## answers every type, scalar and aggregate alike, from aowlabi's descriptors.
+## Keeping a local copy "for the easy cases" is what made `sizeof(cstring)`
+## answer 16 — see the SizeofTagId arm.)
 
 ## Is this expression an LVALUE — something that names storage someone else can
 ## still reach? Those are what have to be copied on assignment. A literal, a
@@ -1972,11 +1948,20 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
     elif t == TrueTagId: (e.emit("true"); skip n)
     elif t == SizeofTagId:
       # `sizeof(T)` silently produced `undefined` — a wrong VALUE for an ordinary
-      # user expression. The scalar widths are known here; an aggregate needs the
-      # layout engine (that is what aowlabi is for) so it fails by name rather
-      # than answering.
+      # user expression. EVERY type, scalar or aggregate, is now answered by
+      # aowlabi: the stack's one layout engine, gated against nimony's own
+      # `sizeof`, against gcc on the struct aowlc prints, and against gcc -m32.
+      #
+      # There used to be a scalar-width table right here as well, and keeping it
+      # for "the easy cases" is exactly what a second implementation is for: it
+      # answered 16 for `sizeof(cstring)`, where nimony (and aowlabi) say 8,
+      # because it had `cstring` grouped with `string` on the two-word arm. One
+      # engine cannot disagree with itself.
+      #
+      # `abiSizeOf` returns -1, never a guess, so what is still unmapped keeps
+      # being REPORTED rather than silently wrong.
       inc n
-      let sz = scalarSizeOf(n)
+      let sz = abiSizeOf(n)
       if sz > 0: e.emit($sz & (if faithfulMode: "n" else: ""))
       else:
         noteFeatureGap("sizeof of a non-scalar type (needs a layout model)")
@@ -3049,6 +3034,8 @@ proc emitModuleBody*(root: var Cursor): string =
   scanProcBoxed(scanCur2)
   var scanCur3 = root
   scanExcTypes(scanCur3)
+  var scanCur4 = root
+  scanTypeDecls(scanCur4)             # type descriptors, for `sizeof` of an aggregate
   var e = JsEmitter(js: "")
   emitStmt(e, root)
   result = emitDispatchers() & e.js
