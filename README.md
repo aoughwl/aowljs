@@ -23,9 +23,20 @@ compile **itself**.
 > **Two repos, on purpose.**
 > - **`aoughwl/aifjs`** (this one) — the nimony implementation. The real one.
 > - **[`aoughwl/aifjs-js`](https://github.com/aoughwl/aifjs-js)** — the original
->   hand-written **JavaScript** implementation. It's the **bootstrap seed** and
->   the differential oracle: it works today, powers the playground's *Native JS*
->   engine, and is what compiles *this* nimony version the first time.
+>   hand-written **JavaScript** implementation. It is the **bootstrap seed**: it
+>   powers the playground's *Native JS* engine and is what compiles *this* nimony
+>   version the first time.
+>
+> It is **no longer a differential oracle**, which this file used to claim.
+> Measured against the current corpus it agrees on **15 of 61** programs — it
+> predates methods, exceptions, iterators, object variants, value semantics and
+> byte strings, all of which live here now. Treat it as the seed it is; the
+> oracle for this backend is **nimony's own output**, which is what
+> `tests/run_corpus.sh` compares against.
+>
+> (Contrast [`aowlc`](https://github.com/aoughwl/aowlc), whose two printers ARE
+> near-parity — 62/65 — and so are worth diffing against each other in a gate.
+> Same shape, different distance, different right answer.)
 
 ## The one idea
 
