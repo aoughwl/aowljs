@@ -30,7 +30,14 @@ NODE_BIN="$(command -v node || true)"
 pass=0; fail=0; total=0; blocked=0
 
 run_js() {  # $1 = js file -> stdout of the emitted module
-  node -e "process.stdout.write((function(){$(cat "$1")})())" 2>"$OUT/run.log"
+  # READ the file; do not interpolate it into the command line. `node -e
+  # "…$(cat f)…"` puts the whole emitted program in argv, which stops working
+  # past ARG_MAX — and the failure is an EMPTY error, so a large fixture would
+  # look like a mysterious mismatch rather than a harness limit. It also ate NUL
+  # bytes, which is how a `'\0'` char literal once silently became "".
+  node -e 'const fs = require("fs");
+           process.stdout.write((new Function(fs.readFileSync(process.argv[1], "utf8")))());' \
+       "$1" 2>"$OUT/run.log"
 }
 
 # One case: $1 = entry .nim, $2 = case name. A multi-module case names its ENTRY

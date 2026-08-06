@@ -93,84 +93,6 @@ var faithfulMode: bool = false
 proc setFaithful*(b: bool) = faithfulMode = b
 proc isFaithful*(): bool = faithfulMode
 
-## names (mangled) of locals/params that hold a `bigint` in faithful mode — lets
-## assignment RHS / conv coercions / return values know when a leaf must be bigint
-## (with the `n` suffix) rather than a plain `number`.
-var bigVars: seq[string] = @[]
-proc bigContains(nm: string): bool =
-  for b in bigVars:
-    if b == nm: return true
-  return false
-proc bigAdd(nm: string) =
-  if not bigContains(nm): bigVars.add nm
-
-## nimony `char` and `string`/`cstring` both map to a JS `string`, so the emitter
-## can't tell them apart from the type node alone in every context. We track which
-## locals/params are `char` vs `string` so a `char -> int` conversion emits
-## `.charCodeAt(0)` (a JS one-char string has no numeric value) instead of a bogus
-## `Number("A")`/`BigInt("A")`.
-var charVars: seq[string] = @[]
-var strVars: seq[string] = @[]
-proc listHas(xs: seq[string]; nm: string): bool =
-  for x in xs:
-    if x == nm: return true
-  return false
-proc charAdd(nm: string) =
-  if not listHas(charVars, nm): charVars.add nm
-proc strAdd(nm: string) =
-  if not listHas(strVars, nm): strVars.add nm
-
-## names (mangled) of locals/params whose static type is a float. A JS `number`
-## carries no int-vs-float tag at runtime, so `echo`/`$` of a bare float variable
-## would print `1` instead of `1.0` and `int(floatVar)` in faithful mode would hit
-## `BigInt(3.9)` (RangeError). `looksFloat` consults this so those route correctly.
-var floatVars: seq[string] = @[]
-proc floatAdd(nm: string) =
-  if not listHas(floatVars, nm): floatVars.add nm
-
-## names (mangled) of locals/params whose static type is a std/sets `HashSet`/
-## `OrderedSet`. These map to a native JS `Set`, so `len(s)` must emit `.size`
-## (not the seq/array `.length`) and a `contains`/`in` test must emit `.has`.
-## Filled by emitLocal/collectParams when the declared type is a set instance.
-var setVars: seq[string] = @[]
-proc setAdd(nm: string) =
-  if not listHas(setVars, nm): setVars.add nm
-## tuple locals -> the float element indices (base62-free, small): `t[2]` on a
-## `(1, "two", 3.0)` must show `3.0`. Parallel seqs keyed by tuple var name.
-var tupleVars: seq[string] = @[]
-var tupleFloatIdx: seq[seq[int]] = @[]
-proc tupleFloatsFor(nm: string): seq[int] =
-  for i in 0 ..< tupleVars.len:
-    if tupleVars[i] == nm: return tupleFloatIdx[i]
-  return @[]
-proc hasInt(xs: seq[int]; v: int): bool =
-  for x in xs:
-    if x == v: return true
-  return false
-
-## true iff the proc currently being emitted returns a 64-bit int (faithful mode);
-## a bare-literal `return` in such a proc must emit bigint.
-var curRetBig: bool = false
-
-## names (mangled) of the current proc's plain (non-boxed) bigint value params
-## (faithful mode). Coerced to bigint at function entry so an untyped literal
-## argument (`bump(5)` — nimony passes a bare `5`, not `5n`) can't leak a `number`
-## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
-var curBigParams: seq[string] = @[]
-
-
-## JS/TS reserved words that can't stand as a bare identifier — a pretty name that
-## lands on one is prefixed with `_`.
-var jsReserved: seq[string] = @["if","for","class","return","function","var","let",
-  "const","new","delete","typeof","instanceof","in","of","do","while","switch",
-  "case","default","break","continue","this","super","null","true","false","void",
-  "yield","await","async","static","import","export","extends","enum","try","catch",
-  "finally","throw","with","debugger"]
-proc isReservedJs(s: string): bool =
-  for r in jsReserved:
-    if r == s: return true
-  return false
-
 ## A string -> int map, open-addressed. The rename table and the tracking lists
 ## were LINEAR SCANS over every symbol ever seen, and each is consulted once per
 ## symbol OCCURRENCE, so emit time grew as O(n^2.8): a 346 KB `.s.nif` took
@@ -221,6 +143,78 @@ proc smPut(m: var StrMap; k: string; v: int) =
     for j in 0 ..< old.keys.len:
       if old.keys[j].len > 0: smPutRaw(m, old.keys[j], old.vals[j])
   smPutRaw(m, k, v)
+
+
+## names (mangled) of locals/params that hold a `bigint` in faithful mode — lets
+## assignment RHS / conv coercions / return values know when a leaf must be bigint
+## (with the `n` suffix) rather than a plain `number`.
+var bigSet = smNew(256)
+proc bigContains(nm: string): bool = smGet(bigSet, nm) >= 0
+proc bigAdd(nm: string) = smPut(bigSet, nm, 1)
+
+## nimony `char` and `string`/`cstring` both map to a JS `string`, so the emitter
+## can't tell them apart from the type node alone in every context. We track which
+## locals/params are `char` vs `string` so a `char -> int` conversion emits
+## `.charCodeAt(0)` (a JS one-char string has no numeric value) instead of a bogus
+## `Number("A")`/`BigInt("A")`.
+var charSet = smNew(256)
+var strSet = smNew(256)
+## still a linear scan, for the SMALL lists that are also iterated
+proc listHas(xs: seq[string]; nm: string): bool =
+  for x in xs:
+    if x == nm: return true
+  return false
+proc charAdd(nm: string) = smPut(charSet, nm, 1)
+proc strAdd(nm: string) = smPut(strSet, nm, 1)
+
+## names (mangled) of locals/params whose static type is a float. A JS `number`
+## carries no int-vs-float tag at runtime, so `echo`/`$` of a bare float variable
+## would print `1` instead of `1.0` and `int(floatVar)` in faithful mode would hit
+## `BigInt(3.9)` (RangeError). `looksFloat` consults this so those route correctly.
+var floatSet = smNew(256)
+proc floatAdd(nm: string) = smPut(floatSet, nm, 1)
+
+## names (mangled) of locals/params whose static type is a std/sets `HashSet`/
+## `OrderedSet`. These map to a native JS `Set`, so `len(s)` must emit `.size`
+## (not the seq/array `.length`) and a `contains`/`in` test must emit `.has`.
+## Filled by emitLocal/collectParams when the declared type is a set instance.
+var setSet = smNew(256)
+proc setAdd(nm: string) = smPut(setSet, nm, 1)
+## tuple locals -> the float element indices (base62-free, small): `t[2]` on a
+## `(1, "two", 3.0)` must show `3.0`. Parallel seqs keyed by tuple var name.
+var tupleVars: seq[string] = @[]
+var tupleFloatIdx: seq[seq[int]] = @[]
+proc tupleFloatsFor(nm: string): seq[int] =
+  for i in 0 ..< tupleVars.len:
+    if tupleVars[i] == nm: return tupleFloatIdx[i]
+  return @[]
+proc hasInt(xs: seq[int]; v: int): bool =
+  for x in xs:
+    if x == v: return true
+  return false
+
+## true iff the proc currently being emitted returns a 64-bit int (faithful mode);
+## a bare-literal `return` in such a proc must emit bigint.
+var curRetBig: bool = false
+
+## names (mangled) of the current proc's plain (non-boxed) bigint value params
+## (faithful mode). Coerced to bigint at function entry so an untyped literal
+## argument (`bump(5)` — nimony passes a bare `5`, not `5n`) can't leak a `number`
+## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
+var curBigParams: seq[string] = @[]
+
+
+## JS/TS reserved words that can't stand as a bare identifier — a pretty name that
+## lands on one is prefixed with `_`.
+var jsReserved: seq[string] = @["if","for","class","return","function","var","let",
+  "const","new","delete","typeof","instanceof","in","of","do","while","switch",
+  "case","default","break","continue","this","super","null","true","false","void",
+  "yield","await","async","static","import","export","extends","enum","try","catch",
+  "finally","throw","with","debugger"]
+proc isReservedJs(s: string): bool =
+  for r in jsReserved:
+    if r == s: return true
+  return false
 
 ## GLOBAL rename table: original full nimony symbol (`fib.1.main`) -> a readable,
 ## valid JS identifier (`fib`). The key->index map is the lookup; `renameVals`
@@ -428,16 +422,15 @@ proc copyNeeded(c: Cursor): bool =
 ## Used to keep `__cp` out of the scalar paths: it is the identity there, but the
 ## whole point of this backend is that a tight loop compiles to plain JS, and a
 ## call per iteration is not that.
-var scalarVars: seq[string] = @[]
-proc scalarAdd(nm: string) =
-  if not listHas(scalarVars, nm): scalarVars.add nm
+var scalarSet = smNew(1024)
+proc scalarAdd(nm: string) = smPut(scalarSet, nm, 1)
 
 proc isScalarVar(c: Cursor): bool =
   var n = c
   if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
     inc n
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
-    return listHas(scalarVars, mangle(pool.syms[n.symId]))
+    return (smGet(scalarSet, mangle(pool.syms[n.symId])) >= 0)
   return false
 
 ## Is this expression an LVALUE — something that names storage someone else can
@@ -539,9 +532,8 @@ proc typeNamed(c: Cursor): int =
 ## Bindings whose declared type is a `seq`. Needed because a generic instance
 ## reads a seq's length as a FIELD (`xs.len`) rather than through the `len`
 ## magic, and a seq is a JS Array here — see the DotTagId branch.
-var seqVars: seq[string] = @[]
-proc seqAdd(nm: string) =
-  if not listHas(seqVars, nm): seqVars.add nm
+var seqSet = smNew(256)
+proc seqAdd(nm: string) = smPut(seqSet, nm, 1)
 
 proc isSeqType(c: Cursor): bool =
   var n = c
@@ -568,7 +560,7 @@ proc isSeqVar(c: Cursor): bool =
   if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
     inc n
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
-    return listHas(seqVars, mangle(pool.syms[n.symId]))
+    return (smGet(seqSet, mangle(pool.syms[n.symId])) >= 0)
   return false
 
 proc isSeqLenLvalue(c: Cursor): bool =
@@ -654,7 +646,7 @@ proc operandIsSet(c: Cursor): bool =
   if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
     inc n
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
-    return listHas(setVars, mangle(pool.syms[n.symId]))
+    return (smGet(setSet, mangle(pool.syms[n.symId])) >= 0)
   return false
 
 ## at a `(call CALLEE ARG0 …)` with `n` positioned on the callee symbol, is the
@@ -675,20 +667,20 @@ proc callFirstArgIsSeq(c: Cursor): bool =
 proc sourceIsChar(n: Cursor): bool =
   case n.kind
   of CharLit: return true
-  of Symbol, SymbolDef, Ident: return listHas(charVars, mangle(pool.syms[n.symId]))
+  of Symbol, SymbolDef, Ident: return (smGet(charSet, mangle(pool.syms[n.symId])) >= 0)
   of ParLe:
     let t = n.tagEnum
     if t == AtTagId or t == ArratTagId:
       var d = n; inc d
       if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
-        return listHas(strVars, mangle(pool.syms[d.symId]))
+        return (smGet(strSet, mangle(pool.syms[d.symId])) >= 0)
       return false
     elif t == CallTagId or t == HcallTagId or t == CmdTagId:
       var d = n; inc d                        # callee
       if (d.kind == Symbol or d.kind == SymbolDef) and opName(pool.syms[d.symId]) == "[]":
         inc d                                 # container arg
         if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
-          return listHas(strVars, mangle(pool.syms[d.symId]))
+          return (smGet(strSet, mangle(pool.syms[d.symId])) >= 0)
       return false
     elif t == ConvTagId or t == HconvTagId:
       var d = n; inc d
@@ -797,7 +789,7 @@ proc tupleFloatIndices(c: Cursor): seq[int] =
 proc looksFloat(c: Cursor): bool =
   if c.kind == FloatLit: return true
   if c.kind == Symbol or c.kind == SymbolDef or c.kind == Ident:
-    return listHas(floatVars, mangle(pool.syms[c.symId]))
+    return (smGet(floatSet, mangle(pool.syms[c.symId])) >= 0)
   if c.kind != ParLe: return false
   let t = c.tagEnum
   # Inf/-Inf/NaN are float-valued and have their own tags
@@ -1077,13 +1069,13 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
       var probe = n; inc probe
       isStr = (probe.kind == Symbol or probe.kind == SymbolDef or probe.kind == Ident) and
-              listHas(strVars, mangle(pool.syms[probe.symId]))
+              (smGet(strSet, mangle(pool.syms[probe.symId])) >= 0)
       inc n; container = exprToStr(n)
       while n.kind != ParRi: skip n
       consumeParRi n
     else:
       isStr = (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident) and
-              listHas(strVars, mangle(pool.syms[n.symId]))
+              (smGet(strSet, mangle(pool.syms[n.symId])) >= 0)
       container = exprToStr(n)
     if isStr:
       # A JS string is IMMUTABLE, so `s[0] = 'X'` threw "Cannot assign to read

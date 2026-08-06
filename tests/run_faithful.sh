@@ -48,8 +48,11 @@ for f in "$SRC"/*.nim; do
     pass=$((pass+1)); continue
   fi
   # the emitter returns __out; wrap in an IIFE + print so `node file.js` runs it.
-  got="$(node -e "process.stdout.write((function(){$(cat "$OUT/$name.faithful.js")})())" 2>"$OUT/$name.run.log")"
-  fastgot="$(node -e "process.stdout.write((function(){$(cat "$OUT/$name.fast.js")})())" 2>/dev/null)"
+  # READ the file rather than interpolating it into argv — see run_corpus.sh:
+  # the command-line form breaks past ARG_MAX with an EMPTY error, and eats NULs.
+  runjs='const fs = require("fs"); process.stdout.write((new Function(fs.readFileSync(process.argv[1], "utf8")))());'
+  got="$(node -e "$runjs" "$OUT/$name.faithful.js" 2>"$OUT/$name.run.log")"
+  fastgot="$(node -e "$runjs" "$OUT/$name.fast.js" 2>/dev/null)"
   if [ "$got" == "$ref" ]; then
     echo "PASS  $name  (faithful == nimony, byte-exact)"
     if [ "$fastgot" != "$ref" ]; then
