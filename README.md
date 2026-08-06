@@ -92,6 +92,21 @@ tests/run_faithful.sh     # the fast/faithful contrast on programs that overflow
 tests/bench.sh            # emitted JS vs the same program hand-written in JS
 ```
 
+**Every `nimony c` in this repo now goes through the machine-wide lock.** It did
+not before: `build.sh` read `${NIMLOCK:-}`, empty unless a caller happened to
+export it, and the three test scripts called nimony directly. Two nimony
+compiles running at once corrupt each other's link through the shared
+`nimcache_static` — a cross-process hazard a private `--nimcache:` does *not*
+cover, because the static object is shared across caches. The harnesses were
+absorbing it with a five-try retry loop and a `rm -rf` of the cache per attempt,
+which is a workaround for a problem that has a fix.
+
+What that cost was not false greens — an empty reference is scored BLOCKED here,
+so a corrupt build could not pass — but **false reds and unrepeatable runs**: a
+gate whose result depended on whether another instance happened to be compiling.
+It also made `bench.sh` report the machine's load rather than the emitter's
+speed. The retry loop stays as a backstop; the lock is what stops it firing.
+
 `run_corpus.sh` compiles each program with nimony, transpiles the `.s.nif` in
 fast **and** faithful mode, runs both under node and requires a byte match
 against nimony's own stdout. It reports three outcomes, not two: **BLOCKED**

@@ -19,6 +19,12 @@ AOWLJS="$ROOT/bin/aowljs"
 SRC="$HERE/bench"
 NC="/tmp/aowljs-bench-nc"
 OUT="$HERE/_out_bench"
+# The machine-wide compile lock. It matters more here than anywhere: this script
+# reports TIMINGS, and an unlocked nimony compile racing another one does not
+# just risk a corrupt link, it makes every number a measurement of the machine's
+# load rather than of the emitter.
+LOCK="$HOME/.aowl/bin/nimlock"
+[ -x "$LOCK" ] || LOCK=""
 rm -rf "$NC"; mkdir -p "$NC" "$OUT"
 
 [ -x "$AOWLJS" ] || { echo "bench: no $AOWLJS — run build.sh first" >&2; exit 1; }
@@ -38,7 +44,8 @@ for f in "$SRC"/*.nim; do
   [ -f "$ref_js" ] || { echo "  $name: no $name.ref.js to compare against" >&2; fail=1; continue; }
 
   nc="$NC/$name"; rm -rf "$nc"; mkdir -p "$nc"
-  "$NIM/bin/nimony" c --nimcache:"$nc" -f "$f" >"$OUT/$name.build.log" 2>&1
+  # shellcheck disable=SC2086
+  $LOCK "$NIM/bin/nimony" c --nimcache:"$nc" -f "$f" >"$OUT/$name.build.log" 2>&1
   snif="$(grep -l "$name.nim" "$nc"/*.s.nif 2>/dev/null | head -1)"
   [ -n "$snif" ] || { echo "  $name: no .s.nif — see $OUT/$name.build.log" >&2; fail=1; continue; }
   emit_s=$( { /usr/bin/time -f "%e" "$AOWLJS" "$snif" > "$OUT/$name.js"; } 2>&1 ) || {

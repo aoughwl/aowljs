@@ -15,6 +15,10 @@ AIFJS="$ROOT/bin/aifjs"
 SRC="$HERE/faithful"
 NC="/tmp/aifjs-faithful-nc"
 OUT="$HERE/_out_faithful"
+# see run_corpus.sh: the "transient static.o link race" the retry loop below
+# absorbs is a cross-process hazard with a real fix — the machine-wide lock.
+LOCK="$HOME/.aowl/bin/nimlock"
+[ -x "$LOCK" ] || LOCK=""
 rm -rf "$NC"; mkdir -p "$NC" "$OUT"
 
 NODE_BIN="$(command -v node || true)"
@@ -30,7 +34,8 @@ for f in "$SRC"/*.nim; do
   nc="$NC/$name"
   for try in 1 2 3 4 5; do
     rm -rf "$nc"; mkdir -p "$nc"
-    ref="$("$NIM/bin/nimony" c -r --nimcache:"$nc" -f "$f" 2>"$OUT/$name.build.log")"
+    # shellcheck disable=SC2086
+    ref="$($LOCK "$NIM/bin/nimony" c -r --nimcache:"$nc" -f "$f" 2>"$OUT/$name.build.log")"
     snif="$(grep -l "$name.nim" "$nc"/*.s.nif 2>/dev/null | head -1)"
     [ -n "$snif" ] && [ -n "$ref" ] && break
   done

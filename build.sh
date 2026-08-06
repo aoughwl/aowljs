@@ -16,6 +16,16 @@ HL="${HL:-/home/savant/aowlhl}"
 # declared, checked dependency — not a vendored copy, which would put a third
 # implementation of C struct layout in the stack.
 ABI="${ABI:-/home/savant/aowlabi}"
+# The machine-wide compile lock, ON BY DEFAULT. It used to be `${NIMLOCK:-}` —
+# empty unless a caller happened to export it, so the ordinary `./build.sh` ran
+# UNLOCKED and could corrupt its own link against any other nimony compile on
+# the machine through the shared `nimcache_static`. A private `--nimcache:` does
+# not cover that: the static object is shared across caches. Set NIMLOCK= to
+# opt out deliberately.
+if [ -z "${NIMLOCK+x}" ]; then
+  NIMLOCK="$HOME/.aowl/bin/nimlock"
+  [ -x "$NIMLOCK" ] || NIMLOCK=""
+fi
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NC="${NC:-$ROOT/nimcache}"
 

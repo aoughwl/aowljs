@@ -17,6 +17,16 @@ AOWLJS="$ROOT/bin/aowljs"
 SRC="$HERE/corpus"
 NC="/tmp/aowljs-corpus-nc"
 OUT="$HERE/_out_corpus"
+# Every `nimony c` goes through the machine-wide lock. Two nimony compiles
+# running at once corrupt each other's link through `nimcache_static` — a
+# CROSS-PROCESS hazard that a private `--nimcache:` does NOT cover, because the
+# static object is shared. This harness used to compile unlocked and absorb the
+# damage with a 5-try retry loop below; that made a green run depend on nobody
+# else compiling at the same moment, and turned an unlucky machine into a FAIL
+# against this backend's code. The retry loop stays as a backstop, but the lock
+# is what makes it never fire.
+LOCK="$HOME/.aowl/bin/nimlock"
+[ -x "$LOCK" ] || LOCK=""
 rm -rf "$NC"; mkdir -p "$NC" "$OUT"
 
 # Rebuild the emitter first. Without this the gate happily tests a stale binary —
@@ -51,7 +61,8 @@ run_case() {
   local nc="$NC/$name" snif="" ref="" try mode flag got ok
   for try in 1 2 3 4 5; do
     rm -rf "$nc"; mkdir -p "$nc"
-    ref="$("$NIM/bin/nimony" c -r --nimcache:"$nc" -f "$f" 2>"$OUT/$name.build.log")"
+    # shellcheck disable=SC2086
+    ref="$($LOCK "$NIM/bin/nimony" c -r --nimcache:"$nc" -f "$f" 2>"$OUT/$name.build.log")"
     # match the ENTRY module's .s.nif, which is not $name for a multi-module case
     snif="$(grep -l "$entry" "$nc"/*.s.nif 2>/dev/null | head -1)"
     [ -n "$snif" ] && [ -n "$ref" ] && break
