@@ -2520,7 +2520,11 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == TryTagId: emitTry(e, n)
   elif t == TypeTagId: emitType(e, n)
   elif t == VarTagId or t == LetTagId or t == ConstTagId or t == GvarTagId or
-       t == GletTagId or t == ResultTagId or t == CursorTagId: emitLocal(e, n)
+       t == GletTagId or t == ResultTagId or t == CursorTagId or
+       # A THREADVAR is just a module-level variable here: JavaScript has one
+       # thread. `tvar`/`tlet` had no branch, so a user's `var x {.threadvar.}`
+       # was dropped and every use of it was `ReferenceError: x is not defined`.
+       t == TvarTagId or t == TletTagId: emitLocal(e, n)
   elif t == RaiseTagId:
     inc n
     if n.kind == DotToken:                        # `(raise .)` -> re-raise
