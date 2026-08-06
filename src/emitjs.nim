@@ -171,21 +171,79 @@ proc isReservedJs(s: string): bool =
     if r == s: return true
   return false
 
+## A string -> int map, open-addressed. The rename table and the tracking lists
+## were LINEAR SCANS over every symbol ever seen, and each is consulted once per
+## symbol OCCURRENCE, so emit time grew as O(n^2.8): a 346 KB `.s.nif` took
+## 0.23 s, 698 KB took 1.58 s and 1.4 MB took 11.07 s. An empty key means an empty
+## slot, which is safe because a nimony symbol is never "".
+type StrMap = object
+  keys: seq[string]
+  vals: seq[int]
+  count: int
+
+proc hashStr(s: string): uint =
+  var h = 0xcbf29ce484222325'u                 # FNV-1a
+  for ch in s:
+    h = h xor uint(ord(ch))
+    h = h * 0x100000001b3'u
+  return h
+
+proc smNew(cap: int): StrMap =
+  result = StrMap(keys: newSeq[string](cap), vals: newSeq[int](cap), count: 0)
+
+proc smGet(m: StrMap; k: string): int =
+  ## the value, or -1 when absent
+  if m.keys.len == 0: return -1
+  let mask = uint(m.keys.len - 1)
+  var i = hashStr(k) and mask
+  while m.keys[int(i)].len > 0:
+    if m.keys[int(i)] == k: return m.vals[int(i)]
+    i = (i + 1) and mask
+  return -1
+
+proc smPutRaw(m: var StrMap; k: string; v: int) =
+  let mask = uint(m.keys.len - 1)
+  var i = hashStr(k) and mask
+  while m.keys[int(i)].len > 0:
+    if m.keys[int(i)] == k:
+      m.vals[int(i)] = v
+      return
+    i = (i + 1) and mask
+  m.keys[int(i)] = k
+  m.vals[int(i)] = v
+  m.count = m.count + 1
+
+proc smPut(m: var StrMap; k: string; v: int) =
+  if m.keys.len == 0 or (m.count + 1) * 10 >= m.keys.len * 7:
+    let old = m
+    let ncap = if m.keys.len == 0: 256 else: m.keys.len * 2
+    m = smNew(ncap)
+    for j in 0 ..< old.keys.len:
+      if old.keys[j].len > 0: smPutRaw(m, old.keys[j], old.vals[j])
+  smPutRaw(m, k, v)
+
 ## GLOBAL rename table: original full nimony symbol (`fib.1.main`) -> a readable,
-## valid JS identifier (`fib`). Parallel seqs (nimony's `Table.[]=` is `.raises`).
+## valid JS identifier (`fib`). The key->index map is the lookup; `renameVals`
+## keeps the names in insertion order.
 ## `renameTaken` is the set of pretty names already handed out — pre-seeded with the
 ## emitter's own runtime helpers / IIFE+loop temporaries so no USER symbol can ever
 ## shadow them. First sight of a symbol claims its base name; a base already taken by
 ## a DIFFERENT symbol gets `_2`, `_3`, … until unique (guaranteed collision-free;
 ## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
-var renameKeys: seq[string] = @[]
+var renameIdx = smNew(1024)                    # symbol -> index into renameVals
 var renameVals: seq[string] = @[]
-var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset","__eq","__has","__find","_base","_ret","_t","_s","_f",
-  "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
+var takenSet = smNew(1024)                     # pretty names already handed out
 proc prettyTaken(p: string): bool =
-  for a in renameTaken:
-    if a == p: return true
-  return false
+  return smGet(takenSet, p) >= 0
+proc claimPretty(p: string) =
+  smPut(takenSet, p, 1)
+proc seedTaken() =
+  # the emitter's own runtime helpers and temporaries, so no USER symbol can
+  # shadow one of them
+  for r in ["__out","__w","__wf","__sf","__fs","__append","__cp","__isa","__aset",
+            "__eq","__has","__find","_base","_ret","_t","_s","_f",
+            "_i64","_u64","_idiv","_imod","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]:
+    claimPretty(r)
 
 ## the readable base of a nimony symbol: the segment before the first `.`, sanitized
 ## to a valid JS identifier and guarded against reserved words / bad starts / empty.
@@ -228,37 +286,28 @@ proc isModuleLocalSym(name: string): bool =
     if ch == '.': inc dots
   return dots == 1
 
-## a nimony symbol -> a stable, readable, valid JS identifier (see renameTaken).
-proc mangle(name: string): string =
-  let key = if isModuleLocalSym(name): curModuleKey & "|" & name else: name
-  for i in 0 ..< renameKeys.len:
-    if renameKeys[i] == key: return renameVals[i]
+## a nimony symbol -> a stable, readable, valid JS identifier.
+proc mangleKeyed(key, name: string): string =
+  let hit = smGet(renameIdx, key)
+  if hit >= 0: return renameVals[hit]
   let base = prettyBase(name)
   var cand = base
   var k = 2
   while prettyTaken(cand):
     cand = base & "_" & $k
     inc k
-  renameKeys.add key
   renameVals.add cand
-  renameTaken.add cand
+  smPut(renameIdx, key, renameVals.len - 1)
+  claimPretty(cand)
   return cand
+
+proc mangle(name: string): string =
+  mangleKeyed((if isModuleLocalSym(name): curModuleKey & "|" & name else: name), name)
 
 ## A field name, which is shared across modules however it is spelled. Same table,
 ## but never keyed per module — see isModuleLocalSym.
 proc mangleShared(name: string): string =
-  for i in 0 ..< renameKeys.len:
-    if renameKeys[i] == name: return renameVals[i]
-  let base = prettyBase(name)
-  var cand = base
-  var k = 2
-  while prettyTaken(cand):
-    cand = base & "_" & $k
-    inc k
-  renameKeys.add name
-  renameVals.add cand
-  renameTaken.add cand
-  return cand
+  mangleKeyed(name, name)
 
 ## bare callee/operator name — everything before the first `.<digit>`.
 proc opName(name: string): string =
@@ -315,7 +364,7 @@ proc uniqueJs(base: string): string =
   while prettyTaken(cand):
     cand = b & "_" & $k
     inc k
-  renameTaken.add cand
+  claimPretty(cand)
   return cand
 
 ## user `method`s. A JS object here is a plain field bag with no prototype, so
@@ -2524,8 +2573,9 @@ proc scanMethods(n: var Cursor) =
         methDispName.add uniqueJs(key)
         di = methDispKey.len - 1
       let disp = methDispName[di]
-      renameKeys.add raw
+      # every overload's symbol resolves to the group's DISPATCHER
       renameVals.add disp
+      smPut(renameIdx, raw, renameVals.len - 1)
       var recv = ""
       if sh.hasParams:
         var pc = sh.params
@@ -2788,6 +2838,7 @@ proc emitModuleBody*(root: var Cursor): string =
   ## emit ONE module's JS (no prelude/flush): procs float up (JS hoists function
   ## decls), top-level statements run at module scope. Enum-ordinal and var/out
   ## param scans accumulate into the shared tables so cross-module calls resolve.
+  if moduleSeq == 0: seedTaken()      # reserve the emitter's own helper names
   inc moduleSeq                       # see isModuleLocalSym: locals are keyed per module
   curModuleKey = "m" & $moduleSeq
   var scanCur0 = root

@@ -26,7 +26,11 @@ command -v node >/dev/null || { echo "bench: node not on PATH" >&2; exit 1; }
 
 REPS="${REPS:-5}"
 fail=0
-printf '%-14s %10s %10s %8s\n' case emitted hand ratio
+# `emit` is the transpile itself, which is its own regression surface: the rename
+# table was a linear scan consulted once per symbol occurrence, so emit time grew
+# as O(n^2.8) and a 1.4 MB .s.nif took 11 s. It is a hash lookup now (0.19 s), and
+# printing the number here is what would catch that coming back.
+printf '%-14s %8s %10s %10s %8s\n' case emit emitted hand ratio
 
 for f in "$SRC"/*.nim; do
   name="$(basename "$f" .nim)"
@@ -37,8 +41,8 @@ for f in "$SRC"/*.nim; do
   "$NIM/bin/nimony" c --nimcache:"$nc" -f "$f" >"$OUT/$name.build.log" 2>&1
   snif="$(grep -l "$name.nim" "$nc"/*.s.nif 2>/dev/null | head -1)"
   [ -n "$snif" ] || { echo "  $name: no .s.nif — see $OUT/$name.build.log" >&2; fail=1; continue; }
-  "$AOWLJS" "$snif" > "$OUT/$name.js" 2>"$OUT/$name.emit.log" || {
-    echo "  $name: emit failed — see $OUT/$name.emit.log" >&2; fail=1; continue; }
+  emit_s=$( { /usr/bin/time -f "%e" "$AOWLJS" "$snif" > "$OUT/$name.js"; } 2>&1 ) || {
+    echo "  $name: emit failed — see $OUT/$name.js" >&2; fail=1; continue; }
 
   # Best-of-REPS wall time, in milliseconds, plus the answer each side computed.
   read -r emitted_ms emitted_out < <(node -e '
@@ -65,8 +69,13 @@ for f in "$SRC"/*.nim; do
     printf '  %-12s DISAGREE emitted=[%s] hand=[%s]\n' "$name" "$emitted_out" "$hand_out" >&2
     fail=1; continue
   fi
-  ratio=$(node -e "process.stdout.write(($emitted_ms / $hand_ms).toFixed(2))")
-  printf '%-14s %9sms %9sms %7sx\n' "$name" "$emitted_ms" "$hand_ms" "$ratio"
+  # A sub-millisecond run time cannot support a ratio — bigmodule exists for its
+  # EMIT column and runs in 0.08ms, where a "4.00x" would be pure noise inviting
+  # a wrong conclusion.
+  ratio=$(node -e "
+    const a = $emitted_ms, b = $hand_ms;
+    process.stdout.write(a < 1 || b < 1 ? '-' : (a / b).toFixed(2) + 'x');")
+  printf '%-14s %7ss %9sms %9sms %8s\n' "$name" "$emit_s" "$emitted_ms" "$hand_ms" "$ratio"
 done
 
 echo

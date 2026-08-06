@@ -125,6 +125,13 @@ That benchmark immediately earned itself, three times:
 - `xs.add v` went through the string-capable `__append` even for a known seq —
   **1.16x**. A seq is a JS Array; `.push` is enough.
 
+The `emit` column is the transpile itself, and it is its own regression surface.
+The rename table was a linear scan consulted once per symbol *occurrence*, so
+emit time grew as **O(n^2.8)**: 346 KB of `.s.nif` took 0.23s, 698 KB took 1.58s
+and 1.4 MB took **11.07s**. It is a hash lookup now — the same 1.4 MB takes
+**0.19s** — and `tests/bench/bigmodule.nim` (1600 procs, 400 types) is there so
+the number stays visible.
+
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it
 (`lambdalifting.nim` asserts `env.s != SymId(0)`), so there is no reference output
