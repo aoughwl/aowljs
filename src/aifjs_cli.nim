@@ -71,6 +71,12 @@ proc main =
   # `ReferenceError: paramCount is not defined`, naming neither aowljs nor the
   # nimony symbol. stderr, so it never contaminates the emitted JS on stdout, and
   # the exit status stays 0: the output is still valid for everything else.
+  let gaps = unsupportedFeatures()
+  if gaps.len > 0:
+    write stderr, "aifjs: " & $gaps.len & " unsupported language feature(s):\n"
+    for g in gaps:
+      write stderr, "  " & g & "\n"
+
   let missing = undefinedCalls()
   if missing.len > 0:
     write stderr, "aifjs: " & $missing.len & " call(s) with no definition — unsupported here:\n"

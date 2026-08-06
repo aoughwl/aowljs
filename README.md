@@ -151,6 +151,13 @@ program reports, and truthfully: `iterators` reaches std/syncio's C FFI layer
 (`fopen`, `c_fwrite`, `fgets`), which is real file I/O this backend does not
 implement.
 
+A language feature this target cannot honour at all is reported the same way and
+fails where it would have run. `{.emit: "…".}` is inline C: there is no
+JavaScript equivalent, and it had been dropped silently — a proc whose emitted C
+incremented `result` returned 41 where nimony says 42. It now throws
+`aifjs: unsupported: {.emit.} (inline C)`, because a wrong answer is worse than a
+clear stop.
+
 Each reported name also gets a stub, so *reaching* one at run time throws
 `aifjs: unsupported: fopen` rather than `ReferenceError: fopen is not defined` —
 a message that names both this backend and the thing it could not provide. The

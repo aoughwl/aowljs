@@ -260,6 +260,13 @@ proc isReplacedRuntimeName(nm: string): bool =
 var definedVars = smNew(512)
 proc noteVariable(nm: string) = smPut(definedVars, nm, 1)
 
+## Language features this target cannot honour at all, as opposed to symbols it
+## happens not to define. Reported with the undefined calls.
+var featureGaps: seq[string] = @[]
+proc noteFeatureGap(what: string) =
+  if not listHas(featureGaps, what): featureGaps.add what
+proc unsupportedFeatures*(): seq[string] = featureGaps
+
 proc isDroppedHookName(nm: string): bool =
   ## the ARC hooks, after mangling: `=destroy` prettifies to `_destroy`, and a
   ## second one of the same base becomes `_destroy_2`.
@@ -2559,6 +2566,16 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
     else: (e.emit("void ("); emitExpr(e, n); e.emit(");"))
     while n.kind != ParRi: skip n
     consumeParRi n
+  elif t == EmitTagId:
+    # `{.emit: "…".}` is inline C. A JavaScript target cannot honour it — but it
+    # had no branch, so it fell to `else: skip n` and was dropped SILENTLY: a proc
+    # whose emitted C incremented `result` returned 41 where nimony says 42, with
+    # no diagnostic anywhere. (aowlc had the same defect, from grouping `emit`
+    # with `comment`.) Fail where it would have run, and say so at emit time; a
+    # wrong answer is worse than a clear stop.
+    noteFeatureGap("{.emit.} (inline C — no JavaScript equivalent)")
+    e.emit("throw new Error(" & jsString("aifjs: unsupported: {.emit.} (inline C)") & ");")
+    skip n
   elif t == DestroyTagId:
     # an explicit ARC destroy of an element, in the seq implementation nimony
     # inlines. JS is garbage-collected; dropping it is the whole point.
