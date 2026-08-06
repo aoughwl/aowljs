@@ -143,6 +143,13 @@ aifjs: 1 call(s) with no definition — unsupported here:
   paramCount
 ```
 
+Across the whole corpus exactly one FEATURE is reported, and it is true:
+`sizeof` of a non-scalar type. The scalar widths are emitted directly; an
+aggregate needs a real layout model — which is what
+[`aowlabi`](https://github.com/aoughwl/aowlabi) is — so it throws by name rather
+than answering. It appears only inside the system allocation code this backend
+replaces, and no corpus program reaches it.
+
 Three categories are counted rather than listed, because they are deliberate and
 would otherwise drown the signal: nimony's manual memory layer (`alloc`,
 `arcInc`, …), the ARC hooks (`=destroy` & co), and std/sets' table internals,

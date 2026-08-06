@@ -267,15 +267,20 @@ proc noteFeatureGap(what: string) =
   if not listHas(featureGaps, what): featureGaps.add what
 proc unsupportedFeatures*(): seq[string] = featureGaps
 
+proc startsWithStr(s, pre: string): bool =
+  if pre.len > s.len: return false
+  for i in 0 ..< pre.len:
+    if s[i] != pre[i]: return false
+  return true
+
 proc isDroppedHookName(nm: string): bool =
-  ## the ARC hooks, after mangling: `=destroy` prettifies to `_destroy`, and a
-  ## second one of the same base becomes `_destroy_2`.
-  var b = nm
-  var i = b.len
-  while i > 2 and b[i-1] in {'0'..'9'}: dec i
-  if i > 1 and i < b.len and b[i-1] == '_': b = b[0 ..< i-1]
-  return b == "_destroy" or b == "_dup" or b == "_copy" or b == "_wasMoved" or
-         b == "_sink" or b == "_sinkh" or b == "_trace"
+  ## The ARC hooks, after mangling: `=destroy` prettifies to `_destroy`. A PREFIX
+  ## test, not an exact one — an instance for a particular type keeps the type in
+  ## the name (`_destroy_SX45xception0sysvq0asl`), and a second of the same base
+  ## gets `_2`, so matching the whole name missed most of them.
+  return startsWithStr(nm, "_destroy") or startsWithStr(nm, "_dup") or
+         startsWithStr(nm, "_copy") or startsWithStr(nm, "_wasMoved") or
+         startsWithStr(nm, "_sink") or startsWithStr(nm, "_trace")
 
 ## Calls with no definition, split: real gaps first, and a COUNT of the
 ## memory-management names a GC'd target does not implement.
@@ -874,7 +879,10 @@ proc binOp(t: TagEnum): string =
 var floatProcs: seq[string] = @[]
 
 proc isCallTag(t: TagEnum): bool =
-  t == CallTagId or t == CmdTagId or t == InfixTagId or t == PrefixTagId or t == HcallTagId
+  # `proccall` is a call through a proc value; it has the same shape and had no
+  # branch, so it produced `undefined`.
+  t == CallTagId or t == CmdTagId or t == InfixTagId or t == PrefixTagId or
+  t == HcallTagId or t == ProccallTagId
 
 ## best-effort "is this echoed value a float?" (peeks a Cursor copy) — a float
 ## literal, an arithmetic op with a `(f …)` result type, or a float-returning
@@ -1835,6 +1843,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         # not the last child, and not an empty statement list: real code runs first
         if probe.kind != ParRi and not isEmpty: leadingCode = true
       if cnt == 0:
+        noteFeatureGap("an `(expr)` node with no value")
         e.emit("undefined")
       elif not leadingCode:
         var idx = 0
@@ -2010,7 +2019,11 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       noteFeatureGap("expression node '" & $t & "' has no emitter branch")
       skip n; e.emit("undefined")
   else:
-    noteFeatureGap("token kind " & $n.kind & " in expression position")
+    # A bare `.` is nimony's "nothing here" marker — an omitted optional slot,
+    # not a gap, and `undefined` is the right value for it. Anything else in
+    # value position is a real hole and gets named.
+    if n.kind != DotToken:
+      noteFeatureGap("token kind " & $n.kind & " in expression position")
     inc n; e.emit("undefined")
 
 proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
@@ -2435,7 +2448,13 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
     a = exprToStr(n); b = exprToStr(n); consumeParRi n
     if op == "..<": (cmp = " < "; kind = 1)
     elif op == "..": (cmp = " <= "; kind = 1)
-    else: coll = "[]"
+    else:
+      # An infix iterable that is neither `..` nor `..<` became an EMPTY array,
+      # so the loop body simply never ran — no error, exit 0, and nothing in the
+      # output to explain it. That is the same failure the two-variable iterator
+      # bug had, and it is worth a name rather than a shrug.
+      noteFeatureGap("`for` over the infix operator '" & op & "'")
+      coll = "[]"
   else:
     var isCd = false
     if n.kind == ParLe and (n.tagEnum == CallTagId or n.tagEnum == HcallTagId):
