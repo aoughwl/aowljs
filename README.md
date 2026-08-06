@@ -110,15 +110,20 @@ Two properties are covered because they are wrong *silently* when they are wrong
 **Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
 against a hand-written JavaScript version of the same program — the emitted code
 *is* JavaScript, so 1.00x is the target, not a stretch. Currently: a tight
-integer loop **0.98x**, recursive `fib` **1.01x**, seq build + indexed sum
-**1.11x**. It prints and never fails on a ratio (machines and JIT warm-up vary),
-but it does fail if the two sides disagree about the answer — a benchmark
-computing the wrong thing measures nothing.
+integer loop **1.01x**, a case-expression in a loop **1.01x**, recursive `fib`
+**1.01x**, seq build + indexed sum **0.95x**. It prints and never fails on a
+ratio (machines and JIT warm-up vary), but it does fail if the two sides disagree
+about the answer — a benchmark computing the wrong thing measures nothing.
 
-That benchmark immediately earned itself: an if-EXPRESSION was emitting an IIFE,
-so `proc fib(n: int): int = if n < 2: n else: fib(n-1) + fib(n-2)` allocated a
-closure per call and ran **3.66x** slower than hand-written JS. It is a
-conditional expression now.
+That benchmark immediately earned itself, three times:
+
+- an if-EXPRESSION emitted an IIFE, so `proc fib(n: int): int = if n < 2: n else:
+  fib(n-1) + fib(n-2)` allocated a closure per call — **3.66x**. It is a
+  conditional expression now.
+- a case-EXPRESSION assigned to a scalar did the same — **1.20x**. It emits the
+  case as statements assigning into the destination.
+- `xs.add v` went through the string-capable `__append` even for a known seq —
+  **1.16x**. A seq is a JS Array; `.push` is enough.
 
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it

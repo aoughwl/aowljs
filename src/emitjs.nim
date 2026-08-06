@@ -499,6 +499,11 @@ proc isSeqType(c: Cursor): bool =
   while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
         n.tagEnum == SinkTagId or n.tagEnum == LentTagId):
     inc n
+  # In TYPE position `(at seq T)` is a generic instantiation, not an index. A
+  # monomorphised use is a plain symbol (`seq.0.Iotb7mc.`) but an un-instantiated
+  # one keeps this form, and missing it left `result: seq[int]` unrecognised — so
+  # `result.add v` went through the string-capable `__append` instead of `.push`.
+  if n.kind == ParLe and n.tagEnum == AtTagId: inc n
   if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
     return opName(pool.syms[n.symId]) == "seq"
   return false
@@ -609,6 +614,12 @@ proc callFirstArgIsSet(c: Cursor): bool =
   var p = c; inc p                     # past the callee -> first arg
   operandIsSet(p)
 
+## the same question for a seq. `n` is on the CALLEE at this point, so testing it
+## directly asks whether `add` is a seq, which it never is.
+proc callFirstArgIsSeq(c: Cursor): bool =
+  var p = c; inc p
+  isSeqVar(p)
+
 ## true iff the conversion source `n` yields a JS `string` that models a nimony
 ## `char` — a char var/param, a `CharLit`, an index into a `string`, or a nested
 ## char-producing conv. Such a source needs `.charCodeAt(0)` to become an int.
@@ -672,7 +683,7 @@ proc jsString(s: string): string =
 proc emitStmt(e: var JsEmitter; n: var Cursor)
 proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false)
 proc exprToStr(n: var Cursor; wantBig = false): string
-proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool)
+proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool; assignTo = "")
 proc emitBoxArg(e: var JsEmitter; n: var Cursor)
 proc emitArrow(e: var JsEmitter; n: var Cursor)
 proc collExpr(n: var Cursor): string
@@ -1052,6 +1063,20 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     emitIdx(e, n)
     e.emit(")")
     while n.kind != ParRi: skip n
+  elif name == "add" and magic and not faithfulMode and callFirstArgIsSeq(n):
+    # A known seq is a JS Array: `.push` directly. `__append` exists because the
+    # same magic serves strings (immutable, so the target is reassigned) and, in
+    # faithful mode, has to coerce a number into an array of bigints — neither
+    # applies here, and `xs.add v` in a loop is hot enough to care.
+    skip n
+    let lv = exprToStr(n)
+    e.emit("(" & lv & ".push(")
+    let cpv = isLvalueExpr(n) and not isScalarVar(n)
+    if cpv: e.emit("__cp(")
+    emitExpr(e, n)
+    if cpv: e.emit(")")
+    e.emit("))")
+    while n.kind != ParRi: skip n
   elif name == "add" and magic:
     skip n
     let lv = exprToStr(n)                    # target: seq push, or string reassign
@@ -1267,10 +1292,16 @@ proc emitRanges(e: var JsEmitter; rc: var Cursor) =
       e.emit("(_s === " & exprToStr(rc) & ")")
   consumeParRi rc
 
-proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
+proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool; assignTo = "") =
   ## (case SEL (of (ranges V…) BODY) … (else BODY)). Emitted as an if-chain over
   ## a once-bound selector; as an expression it's wrapped in an IIFE. Selector +
   ## branch structure via the shared hlwalk.decodeCase.
+  ##
+  ## `assignTo` is the third form: a case-EXPRESSION whose value is being assigned
+  ## to a known scalar. It emits the STATEMENT shell with `dst = <branch value>`
+  ## in each arm, which skips the IIFE — that closure is allocated on every
+  ## evaluation, and `result = case n mod 5 …` in a loop measured 1.20x against
+  ## hand-written JS because of it.
   var sel = default(Cursor)
   let branches = decodeCase(n, sel)
   var selc = sel
@@ -1278,14 +1309,16 @@ proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
   # so `_s === 0` is always false — coerce the selector to Number for comparison.
   let selStr = if faithfulMode and producesBig(sel): "Number(" & exprToStr(selc) & ")"
                else: exprToStr(selc)
-  if asExpr: e.emit("(function(_s){ ")
+  let toDst = assignTo.len > 0
+  if asExpr and not toDst: e.emit("(function(_s){ ")
   else: e.emit("{ const _s = " & selStr & "; ")
   var first = true
   for br in branches:
     if br.isElse:
       e.emit(" else { ")
       var bc = br.body
-      if asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
+      if toDst: (e.emit(assignTo & " = "); emitExpr(e, bc); e.emit("; }"))
+      elif asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
       else: (emitStmt(e, bc); e.emit(" }"))
     else:
       e.emit(if first: "if(" else: " else if(")
@@ -1294,9 +1327,10 @@ proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
       emitRanges(e, rc)
       e.emit("){ ")
       var bc = br.body
-      if asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
+      if toDst: (e.emit(assignTo & " = "); emitExpr(e, bc); e.emit("; }"))
+      elif asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
       else: (emitStmt(e, bc); e.emit(" }"))
-  if asExpr: e.emit(" })(" & selStr & ")")
+  if asExpr and not toDst: e.emit(" })(" & selStr & ")")
   else: e.emit(" }")
 
 proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
@@ -2074,6 +2108,18 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
     lhsBig = bigContains(mangle(pool.syms[n.symId]))
   let lenLhs = faithfulMode and isSeqLenLvalue(n)
   let lhsScalar = isScalarVar(n)
+  # `dst = case …` where dst is a known scalar: emit the case as STATEMENTS
+  # assigning into dst, so the case-expression's IIFE — a closure per evaluation —
+  # is not allocated. Restricted to a scalar destination so none of the copy or
+  # bigint handling below is bypassed.
+  if lhsScalar and not lhsBig:
+    var probe = n
+    let lhsStr = exprToStr(probe)
+    if probe.kind == ParLe and probe.tagEnum == CaseTagId:
+      skip n                                   # past the lvalue
+      emitCase(e, n, asExpr = false, assignTo = lhsStr)
+      consumeParRi n
+      return
   emitExpr(e, n); e.emit(" = ")
   if lenLhs: e.emit("Number(")     # `.length` takes a number, never a bigint
   # An assignment from an lvalue is a copy for a value type. The LHS's declared
