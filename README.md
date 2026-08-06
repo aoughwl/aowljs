@@ -134,19 +134,28 @@ is the property this backend's `--faithful` flag exists for. `ptr T` is the row
 that found a defect: this backend emits the getter/setter box the matrix
 describes, and the classifier only knew the `ref object` shape.
 
-**The two backends' corpora were re-checked against each other (2026-08-06).**
-`aowljs/tests/corpus/` and `aowlc/examples/` grew from each other but under
-different names — `calc`/`calculator`, `charsets`/`chars_sets`,
-`valuesem`/`value_semantics` — so nothing mechanical can tell they overlap, and
-running each backend's fixtures through the other once found 5 defects here and
-2 in aowlc. Sampled again in both directions, 11 programs: **no defects**. Six
-aowljs fixtures pass aowlc's e2e path and two more are the same programs
-nimony itself cannot run (aowljs already lists them BLOCKED); three aowlc
-fixtures pass here, and the fourth, `e2e_shapes`, differs in fast mode only
-where `int64` exceeds 2^53 and passes under `--faithful` — the documented
-trade-off, not a defect. A full cross-run costs a nimony compile per program
-(~20 s each, so ~45 min for both directions), which is why this is a periodic
-check rather than a gate.
+**The two corpora are cross-checked, by running each through the other.**
+`aowljs/tests/corpus/` and `aowlc/examples/` grew from each other, and running
+each backend's fixtures through the other once found 5 defects here and 2 in
+aowlc — then nothing kept it up. The two also name the same feature differently
+(`calc`/`calculator`, `charsets`/`chars_sets`, `valuesem`/`value_semantics`,
+`iters2`/`iterators_nested`), so no tool can tell they overlap and a fixture
+added to one side is invisible to the other.
+
+`tests/cross.sh` fixes that without a name map. A map would assert that two
+fixtures test the same thing — a claim nobody can check, which rots silently.
+The direct question, *does the other backend handle this program?*, needs no
+map: run it there. It reports three outcomes (BLOCKED = nimony itself has no
+output to compare, so neither backend is being judged), declares a denominator,
+and samples **deterministically** — a gate whose corpus changes per run cannot
+be compared against its last result. `--sample N` for routine use; the full
+sweep is ~45 min and is deliberately not part of `run_corpus.sh`, because a gate
+nobody can afford to run is a gate nobody runs.
+
+A fast-mode-only mismatch on a program that passes `--faithful` is reported as
+the documented trade-off, not a defect — `e2e_shapes` is that case, exceeding
+2^53. Falsified: pointing `$AOWLJS` at `/bin/false` turns it red rather than
+quietly passing.
 
 **Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
 against a hand-written JavaScript version of the same program — the emitted code
