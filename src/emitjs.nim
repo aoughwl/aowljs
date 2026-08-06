@@ -526,6 +526,36 @@ proc isScalarVar(c: Cursor): bool =
     return (smGet(scalarSet, mangle(pool.syms[n.symId])) >= 0)
   return false
 
+## The byte size of a SCALAR type node, or 0 when it is not one. Enough for the
+## `sizeof` a program actually writes; an aggregate needs a real layout model
+## (aowlabi), so it is reported rather than guessed.
+proc scalarSizeOf(c: Cursor): int =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
+    inc n
+  case n.kind
+  of ParLe:
+    let t = n.tagEnum
+    if t == ITagId or t == UTagId or t == FTagId:
+      var d = n; inc d
+      if d.kind == IntLit: return int(pool.integers[d.intId]) div 8
+      return 8
+    elif t == CTagId or t == BoolTagId: return 1
+    elif t == PtrTagId or t == RefTagId or t == ProctypeTagId: return 8
+    elif t == StringTagId or t == CstringTagId: return 16
+    else: return 0
+  of Symbol, SymbolDef, Ident:
+    let nm = opName(pool.syms[n.symId])
+    if nm == "int" or nm == "int64" or nm == "uint" or nm == "uint64" or
+       nm == "float" or nm == "float64" or nm == "Natural" or nm == "Positive": return 8
+    elif nm == "int32" or nm == "uint32" or nm == "float32": return 4
+    elif nm == "int16" or nm == "uint16": return 2
+    elif nm == "int8" or nm == "uint8" or nm == "char" or nm == "bool": return 1
+    elif nm == "string" or nm == "cstring" or nm == "seq": return 16
+    else: return 0
+  else: return 0
+
 ## Is this expression an LVALUE — something that names storage someone else can
 ## still reach? Those are what have to be copied on assignment. A literal, a
 ## constructor or an arithmetic result is already a fresh value.
@@ -1931,13 +1961,56 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
     elif t == CaseTagId:
       emitCase(e, n, true)
     elif t == TrueTagId: (e.emit("true"); skip n)
+    elif t == SizeofTagId:
+      # `sizeof(T)` silently produced `undefined` — a wrong VALUE for an ordinary
+      # user expression. The scalar widths are known here; an aggregate needs the
+      # layout engine (that is what aowlabi is for) so it fails by name rather
+      # than answering.
+      inc n
+      let sz = scalarSizeOf(n)
+      if sz > 0: e.emit($sz & (if faithfulMode: "n" else: ""))
+      else:
+        noteFeatureGap("sizeof of a non-scalar type (needs a layout model)")
+        e.emit("(function(){ throw new Error(" &
+               jsString("aifjs: unsupported: sizeof of a non-scalar type") & "); })()")
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == DupTagId:
+      # `=dup` is ARC's copy-for-a-new-owner. Under a GC the copy is what value
+      # semantics already provide, so this is __cp — never `undefined`.
+      inc n
+      e.emit("__cp("); emitExpr(e, n, wantBig); e.emit(")")
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == AddrTagId:
+      # `addr x` has no JS equivalent, but a var-param already uses an accessor
+      # box for exactly this, so `addr` builds the same thing and `deref` reads
+      # its cell. Previously `undefined`, and then `p[] = 7` threw "cannot assign
+      # to read only property 'undefined'".
+      inc n
+      emitBoxArg(e, n)
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    elif t == DerefTagId:
+      inc n
+      e.emit("("); emitExpr(e, n, wantBig); e.emit(".v)")
+      while n.kind != ParRi: skip n
+      consumeParRi n
     elif t == FalseTagId: (e.emit("false"); skip n)
     elif t == NilTagId: (e.emit("null"); skip n)
     elif isCallTag(t):
       emitCall(e, n)
     else:
-      skip n; e.emit("undefined")   # TODO: sets/generics/var-params from aifjs-js
+      # An expression tag with no branch. This silently produced `undefined`,
+      # which is how `dconv` (so every `{.borrow.}`ed operator returned undefined)
+      # and the `(expr STMTS… VALUE)` mis-read both survived: a wrong VALUE, no
+      # error, nothing in the output to look at. Report the tag so the next one is
+      # a named gap instead of a mystery. Still emits `undefined` — this is the
+      # value position, and there is nothing better to put there.
+      noteFeatureGap("expression node '" & $t & "' has no emitter branch")
+      skip n; e.emit("undefined")
   else:
+    noteFeatureGap("token kind " & $n.kind & " in expression position")
     inc n; e.emit("undefined")
 
 proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
