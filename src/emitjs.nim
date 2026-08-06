@@ -1384,9 +1384,39 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == CastTagId:
-      # (cast TYPE VALUE) — a ref/pointer cast is identity in JS; emit VALUE.
-      inc n; skip n
-      emitExpr(e, n, wantBig)
+      # (cast TYPE VALUE). A ref/pointer cast is identity in JS, but a cast
+      # between INTEGER widths is a reinterpretation and must truncate — this
+      # emitted VALUE unchanged, so `cast[uint8](300)` answered 300 where nimony
+      # says 44 and `cast[uint8](-1)` answered -1 where nimony says 255.
+      inc n
+      var cw = 0
+      var cu = false
+      if n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
+        cu = n.tagEnum == UTagId
+        var d = n; inc d
+        if d.kind == IntLit: cw = int(pool.integers[d.intId])
+      skip n                                  # the target type
+      if cw == 64 and faithfulMode:
+        e.emit(if cu: "_u64(" else: "_i64(")
+        emitBigOperand(e, n)
+        e.emit(")")
+      elif cw > 0 and cw <= 32:
+        var pre = "("
+        var post = ""
+        if cu:
+          if cw == 32: post = " >>> 0)"
+          elif cw == 16: post = " & 0xFFFF)"
+          else: post = " & 0xFF)"
+        else:
+          if cw == 32: post = " | 0)"
+          elif cw == 16: pre = "(("; post = " << 16) >> 16)"
+          else: pre = "(("; post = " << 24) >> 24)"
+        e.emit(pre)
+        if faithfulMode: (e.emit("Number("); emitExpr(e, n); e.emit(")"))
+        else: emitExpr(e, n)
+        e.emit(post)
+      else:
+        emitExpr(e, n, wantBig)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == InstanceofTagId:
