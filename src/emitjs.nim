@@ -280,6 +280,20 @@ proc undefinedCalls*(): seq[string] =
     if isMemoryRuntimeName(nm) or isDroppedHookName(nm) or isReplacedRuntimeName(nm): continue
     result.add nm
 
+## Stubs for the reported gaps. The calls are in the emitted code either way; a
+## stub turns reaching one from `ReferenceError: fopen is not defined` — which
+## names neither this backend nor the thing it could not provide — into a message
+## that says both. Emitted AFTER every module, so a name defined by any of them is
+## not in this list and cannot be shadowed. Costs nothing unless reached.
+proc undefinedStubs*(): string =
+  result = ""
+  # bound to a local: nimony will not borrow an iteration path straight out of a
+  # call ("path is not borrowable")
+  let missing = undefinedCalls()
+  for nm in missing:
+    result.add "function " & nm & "(){ throw new Error(" &
+               jsString("aifjs: unsupported: " & nm) & "); }\n"
+
 proc undefinedMemoryCalls*(): int =
   result = 0
   for nm in calledOrder:

@@ -151,6 +151,12 @@ program reports, and truthfully: `iterators` reaches std/syncio's C FFI layer
 (`fopen`, `c_fwrite`, `fgets`), which is real file I/O this backend does not
 implement.
 
+Each reported name also gets a stub, so *reaching* one at run time throws
+`aifjs: unsupported: fopen` rather than `ReferenceError: fopen is not defined` —
+a message that names both this backend and the thing it could not provide. The
+stubs are emitted after every module, so a name any of them defines is never
+shadowed, and they cost nothing unless reached.
+
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it
 (`lambdalifting.nim` asserts `env.s != SymId(0)`), so there is no reference output

@@ -56,6 +56,11 @@ proc main =
       outp.add emitFile(p)
   outp.add "\n// --- main module ---\n"
   outp.add emitFile(path)
+  # after every module, so a name any of them defines is not stubbed
+  let stubs = undefinedStubs()
+  if stubs.len > 0:
+    outp.add "\n// --- unsupported here: these throw by name if reached ---\n"
+    outp.add stubs
   outp.add jsFlush()
 
   write stdout, outp
