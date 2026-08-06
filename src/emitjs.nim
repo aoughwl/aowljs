@@ -375,6 +375,22 @@ proc copyNeeded(c: Cursor): bool =
   else:
     return false
 
+## Bindings whose declared type needs no copy — scalars, strings, enums, refs.
+## Used to keep `__cp` out of the scalar paths: it is the identity there, but the
+## whole point of this backend is that a tight loop compiles to plain JS, and a
+## call per iteration is not that.
+var scalarVars: seq[string] = @[]
+proc scalarAdd(nm: string) =
+  if not listHas(scalarVars, nm): scalarVars.add nm
+
+proc isScalarVar(c: Cursor): bool =
+  var n = c
+  if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return listHas(scalarVars, mangle(pool.syms[n.symId]))
+  return false
+
 ## Is this expression an LVALUE — something that names storage someone else can
 ## still reach? Those are what have to be copied on assignment. A literal, a
 ## constructor or an arithmetic result is already a fresh value.
@@ -384,9 +400,18 @@ proc isLvalueExpr(c: Cursor): bool =
   of Symbol, SymbolDef, Ident: return true
   of ParLe:
     let t = n.tagEnum
+    if t == ExprTagId:
+      # `(expr STMTS… VALUE)` is an lvalue only if its VALUE is — `@[]` arrives
+      # wrapped in one, and treating the wrapper as an lvalue copied a literal.
+      var last = n
+      inc last
+      var prev = last
+      while last.kind != ParRi:
+        prev = last
+        skip last
+      return prev.kind != ParRi and isLvalueExpr(prev)
     return t == DotTagId or t == DdotTagId or t == AtTagId or t == ArratTagId or
-           t == TupatTagId or t == HderefTagId or t == HaddrTagId or t == DerefTagId or
-           t == ExprTagId
+           t == TupatTagId or t == HderefTagId or t == HaddrTagId or t == DerefTagId
   else: return false
 
 proc objBaseOf(t: string): string =
@@ -1031,8 +1056,10 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n
     let lv = exprToStr(n)                    # target: seq push, or string reassign
     e.emit("(" & lv & " = __append(" & lv & ", ")
-    # `s.add p` stores a COPY of p; otherwise a later `p.x = …` reaches into the seq
-    let cpv = isLvalueExpr(n)
+    # `s.add p` stores a COPY of p; otherwise a later `p.x = …` reaches into the
+    # seq. A known scalar needs none, which matters — `xs.add i` in a loop is the
+    # commonest statement there is.
+    let cpv = isLvalueExpr(n) and not isScalarVar(n)
     if cpv: e.emit("__cp(")
     emitExpr(e, n)
     if cpv: e.emit(")")
@@ -1755,6 +1782,7 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       else: discard
       if isSetType(typeCur): setAdd pnm        # HashSet param -> native JS Set
       if isSeqType(typeCur): seqAdd pnm        # `xs.len` in a generic instance
+      if not copyNeeded(typeCur): scalarAdd pnm   # keeps `__cp` out of hot paths
       if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
       # NOTE: a by-value param needs NO copy on entry. nimony rejects mutating one
       # ("cannot mutate expression p.x"), so the callee cannot write through it,
@@ -1956,6 +1984,7 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   let isSet = isSetType(sh.typ)               # HashSet -> native JS Set
   if isSet: setAdd nm
   if isSeqType(sh.typ): seqAdd nm             # `xs.len` in a generic instance
+  if not copyNeeded(sh.typ): scalarAdd nm     # keeps `__cp` out of hot paths
   let tn = typeNamed(sh.typ)                  # distinguish char (charCodeAt) from string
   if tn == 1: charAdd nm
   elif tn == 2:
@@ -2035,12 +2064,15 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
     lhsBig = bigContains(mangle(pool.syms[n.symId]))
   let lenLhs = faithfulMode and isSeqLenLvalue(n)
+  let lhsScalar = isScalarVar(n)
   emitExpr(e, n); e.emit(" = ")
   if lenLhs: e.emit("Number(")     # `.length` takes a number, never a bigint
   # An assignment from an lvalue is a copy for a value type. The LHS's declared
-  # type is not in reach here, so this leans on the RHS being an lvalue plus
-  # `__cp` being the identity on scalars, strings and `ref`s.
-  let cpRhs = not lhsBig and isLvalueExpr(n)
+  # type is not in reach here beyond whether it was recorded as a scalar, so this
+  # leans on the RHS being an lvalue plus `__cp` being the identity on scalars,
+  # strings and `ref`s — but a KNOWN scalar destination skips the call outright,
+  # which is what keeps it out of arithmetic loops.
+  let cpRhs = not lhsBig and not lhsScalar and isLvalueExpr(n)
   if cpRhs: e.emit("__cp(")
   if lhsBig: emitBigOperand(e, n) else: emitExpr(e, n, lhsBig)
   if cpRhs: e.emit(")")
@@ -2166,6 +2198,10 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
         if firstVar and faithfulMode and int64Kind(n) > 0:
           loopBig = true
           bigAdd vnm
+        # a loop variable is declared here, not through emitLocal — record its
+        # kind too, or `xs.add i` in a loop pays a `__cp` per iteration
+        if not copyNeeded(n): scalarAdd vnm
+        if isSeqType(n): seqAdd vnm
         firstVar = false
         while n.kind != ParRi: skip n  # type, value
         consumeParRi n
