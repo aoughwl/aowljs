@@ -134,6 +134,20 @@ is the property this backend's `--faithful` flag exists for. `ptr T` is the row
 that found a defect: this backend emits the getter/setter box the matrix
 describes, and the classifier only knew the `ref object` shape.
 
+**The two backends' corpora were re-checked against each other (2026-08-06).**
+`aowljs/tests/corpus/` and `aowlc/examples/` grew from each other but under
+different names — `calc`/`calculator`, `charsets`/`chars_sets`,
+`valuesem`/`value_semantics` — so nothing mechanical can tell they overlap, and
+running each backend's fixtures through the other once found 5 defects here and
+2 in aowlc. Sampled again in both directions, 11 programs: **no defects**. Six
+aowljs fixtures pass aowlc's e2e path and two more are the same programs
+nimony itself cannot run (aowljs already lists them BLOCKED); three aowlc
+fixtures pass here, and the fourth, `e2e_shapes`, differs in fast mode only
+where `int64` exceeds 2^53 and passes under `--faithful` — the documented
+trade-off, not a defect. A full cross-run costs a nimony compile per program
+(~20 s each, so ~45 min for both directions), which is why this is a periodic
+check rather than a gate.
+
 **Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
 against a hand-written JavaScript version of the same program — the emitted code
 *is* JavaScript, so 1.00x is the target, not a stretch. Currently: a tight
