@@ -125,9 +125,14 @@ consumer that turns that claim into real JavaScript values. Its
 `tests/jsrepr.sh` declares one global per type, transpiles it here in **both**
 modes, runs the emitted module and classifies the value structurally — `typeof`,
 `Array.isArray`, `instanceof Set` — never by matching this emitter's own output
-text, which would agree by construction. **17/17.** `int64` is the row where the
+text, which would agree by construction. **20/20** — one probe for every
+`AbiKind` aowlabi has, with `UncheckedArray` the single declared hold-out (a
+trailing flexible member has no standalone value to classify), and that claim
+fails by name if a kind is added without a probe. `int64` is the row where the
 two modes have to differ (a JS number in fast mode, a BigInt in faithful), which
-is the property this backend's `--faithful` flag exists for.
+is the property this backend's `--faithful` flag exists for. `ptr T` is the row
+that found a defect: this backend emits the getter/setter box the matrix
+describes, and the classifier only knew the `ref object` shape.
 
 **Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
 against a hand-written JavaScript version of the same program — the emitted code
