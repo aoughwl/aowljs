@@ -1467,21 +1467,30 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       skip n
       while n.kind != ParRi: skip n
       consumeParRi n
-    elif t == IfTagId:                          # if-EXPRESSION -> IIFE
+    elif t == IfTagId:
+      # An if-EXPRESSION becomes a CONDITIONAL, not an IIFE. It used to emit
+      # `(function(){ if(…){ return … } else { return … } })()`, which allocates
+      # a closure and makes a call on every evaluation — `proc fib(n: int): int =
+      # if n < 2: n else: fib(n-1) + fib(n-2)` ran 3.66x slower than the same
+      # function written in JS by hand, and recursion is where that compounds.
+      # Every branch body is already emitted as an expression here, so the
+      # ternary chain is a straight substitution. A branch that genuinely needs
+      # statements arrives as `(expr (stmts …) VALUE)` and keeps its own IIFE.
       inc n
-      e.emit("(function(){ ")
-      var ifirst = true
+      var opened = 0
+      var sawElse = false
       while n.kind != ParRi:
         if n.kind == ParLe and n.tagEnum == ElifTagId:
           inc n
-          e.emit(if ifirst: "if(" else: " else if(")
-          ifirst = false
-          emitExpr(e, n); e.emit("){ return "); emitExpr(e, n); e.emit("; }")
+          e.emit("("); emitExpr(e, n); e.emit(" ? "); emitExpr(e, n); e.emit(" : ")
+          inc opened
           consumeParRi n
         elif n.kind == ParLe and n.tagEnum == ElseTagId:
-          inc n; e.emit(" else { return "); emitExpr(e, n); e.emit("; }"); consumeParRi n
+          inc n; emitExpr(e, n); sawElse = true; consumeParRi n
         else: skip n
-      e.emit(" })()"); consumeParRi n
+      if not sawElse: e.emit("undefined")
+      for _ in 0 ..< opened: e.emit(")")
+      consumeParRi n
     elif t == SetconstrTagId:                   # set literal -> JS Set
       inc n; skip n                             # (set TYPE)
       e.emit("(function(){ const _s = new Set(); ")

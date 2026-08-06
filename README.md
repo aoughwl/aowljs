@@ -78,6 +78,7 @@ Working, with a gate that says what it covers.
 ```sh
 tests/run_corpus.sh       # every program, in BOTH modes, against nimony's own output
 tests/run_faithful.sh     # the fast/faithful contrast on programs that overflow 2^53
+tests/bench.sh            # emitted JS vs the same program hand-written in JS
 ```
 
 `run_corpus.sh` compiles each program with nimony, transpiles the `.s.nif` in
@@ -105,6 +106,19 @@ Two properties are covered because they are wrong *silently* when they are wrong
   Literals are emitted one code unit per byte so `len`, indexing, slicing and
   iteration agree with nimony exactly, and the output is decoded back to text at
   the end (`string_bytes.nim`, `string_print.nim`).
+
+**Speed is measured, not asserted.** `tests/bench.sh` times the emitted JS
+against a hand-written JavaScript version of the same program — the emitted code
+*is* JavaScript, so 1.00x is the target, not a stretch. Currently: a tight
+integer loop **0.98x**, recursive `fib` **1.01x**, seq build + indexed sum
+**1.11x**. It prints and never fails on a ratio (machines and JIT warm-up vary),
+but it does fail if the two sides disagree about the answer — a benchmark
+computing the wrong thing measures nothing.
+
+That benchmark immediately earned itself: an if-EXPRESSION was emitting an IIFE,
+so `proc fib(n: int): int = if n < 2: n else: fib(n-1) + fib(n-2)` allocated a
+closure per call and ran **3.66x** slower than hand-written JS. It is a
+conditional expression now.
 
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it
