@@ -182,6 +182,13 @@ a message that names both this backend and the thing it could not provide. The
 stubs are emitted after every module, so a name any of them defines is never
 shadowed, and they cost nothing unless reached.
 
+`src/webmain_js.nim`, the browser entry, **does not build and nothing builds
+it** — two of its imports no longer resolve (a hardcoded relative path to a
+sibling checkout renamed `aifi` → `aowli`, and a `jsffi` module that is not in
+the nimony tree at all). It is a design sketch; the playground's *Native JS*
+engine is served by `aoughwl/aifjs-js`. Said here so it is not mistaken for part
+of the working product.
+
 Known gap: a closure that captures a local and is **returned** from the proc
 owning it. aowljs transpiles it correctly, but nimony's own hexer cannot build it
 (`lambdalifting.nim` asserts `env.s != SymId(0)`), so there is no reference output
